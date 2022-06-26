@@ -252,6 +252,8 @@ def generate_edges(mesh, shape_object, bones, scale, connect_mesh=False, connect
     faces = []
     rig_type = identify_rig()
 
+    parent_bone_name = ""
+
     # edge generator loop
     for b in bones:
         # look for rig's hands and their childs
@@ -318,7 +320,9 @@ def generate_edges(mesh, shape_object, bones, scale, connect_mesh=False, connect
     idx=0
     pin_group = []
     for b in bones:
-
+        if idx == 0:
+            parent_bone_name = b.parent.name
+        
         if idx % (chain_count+1) == 0:
             pin_group.append(idx)
             idx = idx + 1
@@ -343,8 +347,11 @@ def generate_edges(mesh, shape_object, bones, scale, connect_mesh=False, connect
     new_vertex_group = shape_object.vertex_groups.new(name="pin_group") 
     new_vertex_group.add(pin_group, 1.0, 'REPLACE')
 
+    # print("parent_bone_name")
+    # print(parent_bone_name)
+    
 
-    return alternate_scale_idx_list, rig_type
+    return alternate_scale_idx_list, rig_type ,parent_bone_name
 
 
 
@@ -446,11 +453,14 @@ def generate_plate(shape_object, size, thickness=0.8, finger_thickness=0.25, sub
     if len(root_idx) > 0:
         select_vertices(shape_object, root_idx)
         bpy.ops.object.skin_root_mark(override)
+    
     # skin in edit mode
-    # add Subsurf modifier
-    # shape_object.modifiers.new("Subsurf", 'SUBSURF')
-    # shape_object.modifiers["Subsurf"].levels = sub_level
-    # shape_object.modifiers["Subsurf"].render_levels = sub_level
+    # add cloth modifier
+    shape_object.modifiers.new("Cloth", 'CLOTH')
+    # shape_object.modifiers["cloth"].levels = sub_level
+    # shape_object.modifiers["cloth"].render_levels = sub_level
+    bpy.context.object.modifiers["Cloth"].settings.vertex_group_mass = "pin_group"
+
 
     bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -498,8 +508,8 @@ def main(context):
     bpy.ops.object.rotation_clear(clear_delta=False)
     bpy.ops.object.location_clear(clear_delta=False)
     bpy.ops.object.scale_clear(clear_delta=False)
-    if sknfy.apply_mod and sknfy.parent_armature:
-        armature_object.data.pose_position = 'REST'
+    # if sknfy.apply_mod and sknfy.parent_armature:
+    #     armature_object.data.pose_position = 'REST'
 
     scale = bpy.context.object.scale
     size = bpy.context.object.dimensions[2]
@@ -517,7 +527,7 @@ def main(context):
 
     # this way we fit mesh and bvh with armature modifier correctly
 
-    alternate_scale_idx_list, rig_type = generate_edges(
+    alternate_scale_idx_list, rig_type, parent_bone_name = generate_edges(
                                                 me, ob, bone_selection, scale, sknfy.connect_mesh,
                                                 sknfy.connect_parents, sknfy.head_ornaments,
                                                 sknfy.generate_all, sknfy.sub_level
@@ -526,19 +536,40 @@ def main(context):
     generate_plate(ob, size, sknfy.thickness, sknfy.finger_thickness, sknfy.sub_level,
                   sknfy.connect_mesh, sknfy.connect_parents, sknfy.generate_all,
                   sknfy.apply_mod, alternate_scale_idx_list, rig_type, bone_selection)
+    
+    # scn.objects.active = armature_object
+    # ob.selected = True
+    # armature_object.active = armature_object.bones[parent_bone_name]
+    # bpy.ops.ob.parent_set(type='BONE_RELATIVE')
+    # bpy.ops.object.parent_bone = parent_bone_name
+    
+
+    # ob.parent = armature_object
+    # #armature_object.active = armature_object.bones
+    # ob.parent_type = 'BONE_RELATIVE'
+    # ob.parent_bone = parent_bone_name
+    
 
     # parent mesh with armature only if modifiers are applied
-    # if sknfy.apply_mod and sknfy.parent_armature:
-    #     bpy.ops.object.mode_set(mode='OBJECT')
-    #     bpy.ops.object.select_all(action='DESELECT')
-    #     ob.select_set(True)
-    #     armature_object.select_set(True)
-    #     bpy.context.view_layer.objects.active = armature_object
+    if sknfy.apply_mod and sknfy.parent_armature:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        ob.select_set(True)
+        armature_object.select_set(True)
+        bpy.context.view_layer.objects.active = armature_object
 
-    #     bpy.ops.object.parent_set(type='ARMATURE_AUTO')
-    #     armature_object.data.pose_position = old_pose_pos
-    #     armature_object.select_set(False)
-    # else:
+        # bones = bpy.data.armatures[armature_object.name].bones
+        # armature_object.active = bones[parent_bone_name]
+        print("BONE_RELATIVE")
+        print(parent_bone_name)
+        
+        bpy.ops.object.parent_set(type='BONE')
+        bpy.ops.object.parent_bone = parent_bone_name
+        armature_object.data.pose_position = old_pose_pos
+        armature_object.select_set(False)
+
+
+    # # else:
     #     bpy.ops.object.mode_set(mode='OBJECT')
     #     ob.location = oldLocation
     #     ob.rotation_euler = oldRotation
@@ -547,10 +578,21 @@ def main(context):
     #     armature_object.select_set(True)
     #     scn.objects.active = armature_object
 
+
+    # skin in edit mode
+    # add Subsurf modifier
+    # shape_object.modifiers.new("Subsurf", 'SUBSURF')
+    # shape_object.modifiers["Subsurf"].levels = sub_level
+    # shape_object.modifiers["Subsurf"].render_levels = sub_level
+
     armature_object.location = oldLocation
     armature_object.rotation_euler = oldRotation
     armature_object.scale = oldScale
     bpy.ops.object.mode_set(mode='OBJECT')
+
+
+
+
 
     return {'FINISHED'}, me
 
@@ -604,6 +646,11 @@ class BONE_PT_custom_shape(Panel):
         split = layout.split(factor=0.3)
         split.label(text="Mesh Density:")
         split.prop(scn, "sub_level", icon='MESH_ICOSPHERE')
+        
+        # row = layout.row()
+        # split = layout.split(factor=0.3)
+        # split.label(text="Parent Bone")
+        # split.prop(scn, "parent_bones", icon='BONE_DATA')
 
         row = layout.row()
         row.prop(scn, "connect_mesh", icon='EDITMODE_HLT')
@@ -638,6 +685,10 @@ class Skinify_Properties(PropertyGroup):
             default=1,
             description="Adjust finger thickness relative to body const=1 can not change"
             )
+    parent_bones:FloatProperty(
+         name="Parent Bones",
+         description="chooes the parent object for simulation object"
+    )
     connect_mesh: BoolProperty(
             name="Solid Shape",
             default=False,
