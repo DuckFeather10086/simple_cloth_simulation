@@ -4,13 +4,13 @@ import bpy
 import bmesh
 from bpy.props import FloatProperty, BoolProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
-from mathutils import Vector
+from mathutils import Vector, Matrix
 from collections import defaultdict
 
 bl_info = {
     "name": "Skeletal Weaver",
     "author": "Duck Feather",
-    "version": (2, 1, 0),
+    "version": (2, 2, 0),
     "blender": (2, 80, 0),
     "location": "Pose Mode > Sidebar > Skeletal Weaver",
     "description": "Generates helper meshes (grid/web) based on selected bones in an Armature",
@@ -58,45 +58,38 @@ def identify_mesh_groups(selected_bones, armature_obj):
     Returns:
         List of mesh group dicts, each containing:
         - 'chain_roots': list of bones that start chains in this group
-        - 'parent_bone': the bone to parent the mesh to (None for primary group uses topmost root's parent)
+        - 'parent_bone': the bone to parent the mesh to
         - 'all_bones': set of all bones in this group
     """
     selected_names = {b.name for b in selected_bones}
     
-    # Categorize bones into primary roots and secondary roots
-    primary_roots = []  # Parent not in selection
-    secondary_roots = defaultdict(list)  # Grouped by parent bone name
+    primary_roots = []
+    secondary_roots = defaultdict(list)
     
     for bone in selected_bones:
         if bone.parent is None or bone.parent.name not in selected_names:
-            # Primary root: parent not selected
             primary_roots.append(bone)
         elif not bone.bone.use_connect:
-            # Secondary root: parent selected but not connected
             secondary_roots[bone.parent.name].append(bone)
     
     mesh_groups = []
     
-    # Process primary group
     if primary_roots:
         primary_group = {
             'chain_roots': primary_roots,
-            'parent_bone': None,  # Will be determined later
+            'parent_bone': None,
             'all_bones': set(),
         }
         
-        # Trace all bones in primary group (following connected children)
         for root in primary_roots:
             chain = trace_chain_bones(root, selected_bones)
             primary_group['all_bones'].update(chain)
         
-        # Find parent bone for primary group (parent of topmost root)
         topmost_root = max(primary_roots, key=lambda b: b.bone.head_local.z)
         primary_group['parent_bone'] = topmost_root.parent
         
         mesh_groups.append(primary_group)
     
-    # Process secondary groups (each parent's disconnected children form a separate mesh)
     for parent_name, roots in secondary_roots.items():
         parent_bone = armature_obj.pose.bones.get(parent_name)
         
@@ -106,7 +99,6 @@ def identify_mesh_groups(selected_bones, armature_obj):
             'all_bones': set(),
         }
         
-        # Trace all bones in this secondary group
         for root in roots:
             chain = trace_chain_bones(root, selected_bones)
             secondary_group['all_bones'].update(chain)
@@ -191,20 +183,16 @@ def build_bone_matrix_for_group(mesh_group, armature_obj, selected_bones):
     if not chain_roots:
         return None, 0, 0
     
-    # Sort chain roots by X coordinate
     chain_starts = sort_chain_starts_by_x(chain_roots, armature_obj)
     
-    # Build chains
     chains = []
     for start in chain_starts:
         chain = trace_chain(start, selected_bones)
         chains.append(chain)
     
-    # Find max rows
     max_rows = max(len(chain) for chain in chains) if chains else 0
     max_cols = len(chains)
     
-    # Build matrix with None padding
     bone_matrix = []
     for chain in chains:
         column = []
@@ -230,9 +218,6 @@ def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
     Returns:
         - coord_matrix[col][row] = Vector or None
         - The matrix has max_rows + 1 rows (to include tail of last bones)
-    
-    IMPORTANT: The tail is placed immediately after the last valid head in each column,
-    NOT at the very end. This ensures the head→tail edge is created properly.
     """
     coord_matrix = []
     total_rows = max_rows + 1
@@ -241,7 +226,6 @@ def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
         column = []
         last_valid_bone = None
         
-        # Add heads for all valid bones (stop at first None)
         for row_idx in range(max_rows):
             bone = bone_matrix[col_idx][row_idx]
             if bone is not None:
@@ -249,15 +233,12 @@ def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
                 column.append(head_world.copy())
                 last_valid_bone = bone
             else:
-                # Chain ended, stop here to add tail next
                 break
         
-        # Add tail of last valid bone IMMEDIATELY after the last head
         if last_valid_bone is not None:
             tail_world = armature_obj.matrix_world @ last_valid_bone.tail
             column.append(tail_world.copy())
         
-        # Pad with None to reach total_rows
         while len(column) < total_rows:
             column.append(None)
         
@@ -269,6 +250,111 @@ def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
 # =============================================================================
 # MESH GENERATION
 # =============================================================================
+
+def create_ribbon_mesh(coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_width, armature_obj):
+    """
+    Create a ribbon (thin rectangular strip) mesh for single-column chains.
+    The ribbon is created by offsetting vertices perpendicular to the bone direction.
+    
+    Returns the created mesh object and coordinate vertex matrix.
+    """
+    mesh = bpy.data.meshes.new(mesh_name + "_mesh")
+    bm = bmesh.new()
+    
+    total_rows = max_rows + 1
+    # For ribbon: 2 columns (left and right offset)
+    vert_matrix = [[None for _ in range(total_rows)] for _ in range(2)]
+    
+    # Get the single column coordinates
+    coords = coord_matrix[0]
+    
+    # Calculate perpendicular offset direction for ribbon
+    # Use the first bone's local X axis as the offset direction
+    first_bone = bone_matrix[0][0]
+    if first_bone is not None:
+        # Get bone's world matrix to find its local X axis
+        bone_world_matrix = armature_obj.matrix_world @ first_bone.bone.matrix_local
+        # Local X axis in world space
+        offset_dir = Vector((bone_world_matrix[0][0], bone_world_matrix[0][1], bone_world_matrix[0][2])).normalized()
+    else:
+        # Fallback: use world X axis
+        offset_dir = Vector((1, 0, 0))
+    
+    half_width = ribbon_width / 2.0
+    
+    # Create vertices with offset
+    for row in range(total_rows):
+        coord = coords[row]
+        if coord is not None:
+            # Left vertex (negative offset)
+            left_pos = coord - offset_dir * half_width
+            vert_left = bm.verts.new(left_pos)
+            vert_matrix[0][row] = vert_left
+            
+            # Right vertex (positive offset)
+            right_pos = coord + offset_dir * half_width
+            vert_right = bm.verts.new(right_pos)
+            vert_matrix[1][row] = vert_right
+    
+    bm.verts.ensure_lookup_table()
+    
+    # Create edges along both sides
+    for col in range(2):
+        for row in range(total_rows - 1):
+            v1 = vert_matrix[col][row]
+            v2 = vert_matrix[col][row + 1]
+            if v1 is not None and v2 is not None:
+                try:
+                    bm.edges.new((v1, v2))
+                except ValueError:
+                    pass
+    
+    # Create horizontal edges and faces
+    for row in range(total_rows):
+        v_left = vert_matrix[0][row]
+        v_right = vert_matrix[1][row]
+        if v_left is not None and v_right is not None:
+            try:
+                bm.edges.new((v_left, v_right))
+            except ValueError:
+                pass
+    
+    # Create quad faces
+    for row in range(total_rows - 1):
+        v_tl = vert_matrix[0][row]
+        v_tr = vert_matrix[1][row]
+        v_bl = vert_matrix[0][row + 1]
+        v_br = vert_matrix[1][row + 1]
+        
+        if all(v is not None for v in [v_tl, v_tr, v_bl, v_br]):
+            try:
+                bm.faces.new((v_tl, v_tr, v_br, v_bl))
+            except ValueError:
+                pass
+    
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=0.0001)
+    
+    # Extract coordinates before freeing
+    coord_vert_matrix = [[None for _ in range(total_rows)] for _ in range(2)]
+    for col in range(2):
+        for row in range(total_rows):
+            if vert_matrix[col][row] is not None:
+                coord_vert_matrix[col][row] = vert_matrix[col][row].co.copy()
+    
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    
+    obj = bpy.data.objects.new(mesh_name, mesh)
+    bpy.context.collection.objects.link(obj)
+    
+    # Return with expanded bone_matrix for vertex group creation
+    # Duplicate the single column for both sides
+    expanded_bone_matrix = [bone_matrix[0], bone_matrix[0]]
+    
+    return obj, coord_vert_matrix, expanded_bone_matrix, 2
+
 
 def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
     """
@@ -310,7 +396,6 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
         col_left = col
         col_right = col + 1
         
-        # Find the last valid row index for each column
         last_valid_left = -1
         last_valid_right = -1
         
@@ -320,7 +405,6 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
             if vert_matrix[col_right][row] is not None:
                 last_valid_right = row
         
-        # Process each row
         for row in range(total_rows - 1):
             v_tl = vert_matrix[col_left][row]
             v_bl = vert_matrix[col_left][row + 1]
@@ -340,7 +424,6 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
                 except ValueError:
                     pass
         
-        # Handle end cases where one column is shorter
         if last_valid_left != last_valid_right:
             if last_valid_left < last_valid_right:
                 last_left_vert = vert_matrix[col_left][last_valid_left]
@@ -383,13 +466,9 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
             except ValueError:
                 pass
     
-    # Recalculate normals
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-    
-    # Remove duplicate vertices
     bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=0.0001)
     
-    # Extract coordinates BEFORE freeing bmesh
     coord_vert_matrix = [[None for _ in range(total_rows)] for _ in range(max_cols)]
     for col in range(max_cols):
         for row in range(total_rows):
@@ -433,11 +512,27 @@ def create_vertex_groups(mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max
                 if coord_key in coord_to_idx:
                     vert_idx = coord_to_idx[coord_key]
                     
+                    # Row 0 is the first HEAD position - Pin only, no bone assignment
+                    # (This vertex is pinned, no bone tracks to it)
                     if row == 0:
                         pin_group.add([vert_idx], 1.0, 'REPLACE')
-                    
-                    if row < max_rows:
-                        bone = bone_matrix[col][row]
+                    else:
+                        # Row N (N > 0) is the TAIL position of bone[N-1]
+                        # So assign to bone_matrix[col][N-1]
+                        prev_row = row - 1
+                        bone = None
+                        
+                        if prev_row < max_rows:
+                            bone = bone_matrix[col][prev_row]
+                        
+                        # If bone at prev_row is None, find last valid bone
+                        if bone is None:
+                            for r in range(prev_row - 1, -1, -1):
+                                if r < max_rows:
+                                    bone = bone_matrix[col][r]
+                                    if bone is not None:
+                                        break
+                        
                         if bone is not None:
                             group_name = bone.name
                             if group_name not in mesh_obj.vertex_groups:
@@ -445,17 +540,41 @@ def create_vertex_groups(mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max
                             else:
                                 bone_group = mesh_obj.vertex_groups[group_name]
                             bone_group.add([vert_idx], 1.0, 'REPLACE')
-                    else:
-                        for r in range(max_rows - 1, -1, -1):
-                            bone = bone_matrix[col][r]
-                            if bone is not None:
-                                group_name = bone.name
-                                if group_name not in mesh_obj.vertex_groups:
-                                    bone_group = mesh_obj.vertex_groups.new(name=group_name)
-                                else:
-                                    bone_group = mesh_obj.vertex_groups[group_name]
-                                bone_group.add([vert_idx], 1.0, 'REPLACE')
-                                break
+
+
+def add_cloth_modifier(mesh_obj):
+    """
+    Add cloth modifier to mesh with Pin vertex group.
+    """
+    cloth_mod = mesh_obj.modifiers.new("Cloth", 'CLOTH')
+    cloth_mod.settings.vertex_group_mass = "Pin"
+    return cloth_mod
+
+
+def add_bone_constraints(mesh_obj, bone_matrix, max_rows, max_cols):
+    """
+    Add DAMPED_TRACK constraints to bones targeting their vertex groups.
+    """
+    added_constraints = []
+    processed_bones = set()
+    
+    for col in range(max_cols):
+        for row in range(max_rows):
+            bone = bone_matrix[col][row]
+            if bone is not None and bone.name not in processed_bones:
+                processed_bones.add(bone.name)
+                
+                # Check if vertex group exists for this bone
+                if bone.name in mesh_obj.vertex_groups:
+                    # Add DAMPED_TRACK constraint
+                    constraint = bone.constraints.new('DAMPED_TRACK')
+                    constraint.target = mesh_obj
+                    constraint.subtarget = bone.name
+                    constraint.track_axis = 'TRACK_Y'
+                    
+                    added_constraints.append((bone.name, constraint.name))
+    
+    return added_constraints
 
 
 def parent_mesh_to_armature(mesh_obj, armature_obj, parent_bone):
@@ -544,6 +663,7 @@ class SKELETALWEAVER_OT_weave(Operator):
         bpy.ops.object.mode_set(mode='OBJECT')
         
         created_meshes = []
+        all_bone_matrices = []
         
         # Process each mesh group
         for group_idx, mesh_group in enumerate(mesh_groups):
@@ -566,23 +686,57 @@ class SKELETALWEAVER_OT_weave(Operator):
             else:
                 mesh_name = f"{MESH_GUIDE_NAME}_{group_idx}"
             
-            mesh_obj, vert_matrix = create_woven_mesh(
-                coord_matrix, bone_matrix, max_rows, max_cols, mesh_name
-            )
+            # Check if single column - create ribbon instead
+            if max_cols == 1:
+                mesh_obj, vert_matrix, expanded_bone_matrix, actual_cols = create_ribbon_mesh(
+                    coord_matrix, bone_matrix, max_rows, mesh_name, 
+                    props.ribbon_width, armature_obj
+                )
+                # Use expanded bone matrix for vertex groups
+                bone_matrix_for_groups = expanded_bone_matrix
+                max_cols_for_groups = actual_cols
+            else:
+                mesh_obj, vert_matrix = create_woven_mesh(
+                    coord_matrix, bone_matrix, max_rows, max_cols, mesh_name
+                )
+                bone_matrix_for_groups = bone_matrix
+                max_cols_for_groups = max_cols
             
             # Create vertex groups
             if props.create_vertex_groups:
-                create_vertex_groups(mesh_obj, vert_matrix, bone_matrix, max_rows, max_cols)
+                create_vertex_groups(mesh_obj, vert_matrix, bone_matrix_for_groups, 
+                                   max_rows, max_cols_for_groups)
             
             # Parent to appropriate bone
             parent_mesh_to_armature(mesh_obj, armature_obj, mesh_group['parent_bone'])
             
+            # Store for later processing
             created_meshes.append({
                 'obj': mesh_obj,
                 'parent': mesh_group['parent_bone'],
+                'bone_matrix': bone_matrix,
+                'max_rows': max_rows,
+                'max_cols': max_cols,
                 'verts': len(mesh_obj.data.vertices),
                 'faces': len(mesh_obj.data.polygons),
             })
+        
+        # Add cloth modifier if enabled
+        if props.add_cloth_modifier:
+            for mesh_info in created_meshes:
+                add_cloth_modifier(mesh_info['obj'])
+        
+        # Add bone constraints if enabled
+        total_constraints = 0
+        if props.add_bone_constraints:
+            for mesh_info in created_meshes:
+                constraints = add_bone_constraints(
+                    mesh_info['obj'], 
+                    mesh_info['bone_matrix'],
+                    mesh_info['max_rows'],
+                    mesh_info['max_cols']
+                )
+                total_constraints += len(constraints)
         
         # Return to Pose Mode
         bpy.ops.object.select_all(action='DESELECT')
@@ -600,9 +754,17 @@ class SKELETALWEAVER_OT_weave(Operator):
                 parent_name = m['parent'].name if m['parent'] else "Armature"
                 msg_parts.append(f"'{m['obj'].name}' → {parent_name}")
             
+            extra_info = []
+            if props.add_cloth_modifier:
+                extra_info.append("Cloth")
+            if props.add_bone_constraints:
+                extra_info.append(f"{total_constraints} constraints")
+            
+            extra_str = f" [{', '.join(extra_info)}]" if extra_info else ""
+            
             self.report({'INFO'}, 
                         f"Created {len(created_meshes)} mesh(es) with {total_verts} verts, "
-                        f"{total_faces} faces: {', '.join(msg_parts)}")
+                        f"{total_faces} faces{extra_str}: {', '.join(msg_parts)}")
         else:
             self.report({'WARNING'}, "No meshes could be created")
             return {'CANCELLED'}
@@ -656,6 +818,16 @@ class SKELETALWEAVER_PT_main(Panel):
         box.label(text="Mesh Generation", icon='MESH_GRID')
         col = box.column(align=True)
         col.prop(props, "create_vertex_groups")
+        col.prop(props, "ribbon_width")
+        
+        layout.separator()
+        
+        # Simulation section
+        box = layout.box()
+        box.label(text="Simulation & Rigging", icon='MOD_CLOTH')
+        col = box.column(align=True)
+        col.prop(props, "add_cloth_modifier")
+        col.prop(props, "add_bone_constraints")
         
         layout.separator()
         
@@ -690,6 +862,27 @@ class SkeletalWeaverProperties(PropertyGroup):
     create_vertex_groups: BoolProperty(
         name="Create Vertex Groups",
         description="Create vertex groups for Pin and individual bones",
+        default=True,
+    )
+    
+    ribbon_width: FloatProperty(
+        name="Ribbon Width",
+        description="Width of ribbon mesh when only one chain is selected",
+        default=0.02,
+        min=0.001,
+        max=1.0,
+        unit='LENGTH',
+    )
+    
+    add_cloth_modifier: BoolProperty(
+        name="Add Cloth Modifier",
+        description="Add cloth simulation modifier with Pin group",
+        default=True,
+    )
+    
+    add_bone_constraints: BoolProperty(
+        name="Add Bone Constraints",
+        description="Add DAMPED_TRACK constraints to bones targeting mesh vertices",
         default=True,
     )
 
