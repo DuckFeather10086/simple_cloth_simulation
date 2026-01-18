@@ -225,18 +225,23 @@ def build_bone_matrix_for_group(mesh_group, armature_obj, selected_bones):
 def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
     """
     Extract world-space head coordinates for each bone in the matrix.
-    Also extract the tail of the last bone in each chain for the final row.
+    Also extract the tail of the last bone in each chain immediately after the last head.
     
     Returns:
         - coord_matrix[col][row] = Vector or None
         - The matrix has max_rows + 1 rows (to include tail of last bones)
+    
+    IMPORTANT: The tail is placed immediately after the last valid head in each column,
+    NOT at the very end. This ensures the head→tail edge is created properly.
     """
     coord_matrix = []
+    total_rows = max_rows + 1
     
     for col_idx in range(max_cols):
         column = []
         last_valid_bone = None
         
+        # Add heads for all valid bones (stop at first None)
         for row_idx in range(max_rows):
             bone = bone_matrix[col_idx][row_idx]
             if bone is not None:
@@ -244,13 +249,16 @@ def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
                 column.append(head_world.copy())
                 last_valid_bone = bone
             else:
-                column.append(None)
+                # Chain ended, stop here to add tail next
+                break
         
-        # Add tail of last valid bone as final point
+        # Add tail of last valid bone IMMEDIATELY after the last head
         if last_valid_bone is not None:
             tail_world = armature_obj.matrix_world @ last_valid_bone.tail
             column.append(tail_world.copy())
-        else:
+        
+        # Pad with None to reach total_rows
+        while len(column) < total_rows:
             column.append(None)
         
         coord_matrix.append(column)
