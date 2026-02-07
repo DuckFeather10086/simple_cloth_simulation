@@ -23,7 +23,7 @@ MESH_GUIDE_NAME = "Skeletal_Mesh_Guide"
 
 
 # =============================================================================
-# STEP 0: TOPOLOGY CLEANUP
+# STEP 0: TOPOLOGY CLEANUP & CONSTRAINT REMOVAL
 # =============================================================================
 
 def snap_close_bones(selected_bones, snap_threshold=0.001):
@@ -40,6 +40,100 @@ def snap_close_bones(selected_bones, snap_threshold=0.001):
             distance = (bone.head - bone.parent.tail).length
             if distance < snap_threshold:
                 bone.use_connect = True
+
+
+def remove_damped_track_constraints(pose_bones):
+    """
+    Remove all DAMPED_TRACK constraints from the given pose bones.
+    Returns the count of removed constraints.
+    """
+    removed_count = 0
+    
+    for bone in pose_bones:
+        # Collect constraints to remove (can't modify while iterating)
+        constraints_to_remove = [c for c in bone.constraints if c.type == 'DAMPED_TRACK']
+        
+        for constraint in constraints_to_remove:
+            bone.constraints.remove(constraint)
+            removed_count += 1
+    
+    return removed_count
+
+
+def remove_invalid_constraints(pose_bones):
+    """
+    Remove constraints with invalid/missing targets from the given pose bones.
+    A constraint is considered invalid if:
+    - It has no target object, OR
+    - It has a target but the subtarget (vertex group/bone) doesn't exist
+    
+    Returns the count of removed constraints.
+    """
+    removed_count = 0
+    
+    for bone in pose_bones:
+        constraints_to_remove = []
+        
+        for constraint in bone.constraints:
+            is_invalid = False
+            
+            # Check if constraint has a target attribute
+            if hasattr(constraint, 'target'):
+                target = constraint.target
+                
+                if target is None:
+                    # No target object set
+                    is_invalid = True
+                elif hasattr(constraint, 'subtarget') and constraint.subtarget:
+                    # Has subtarget specified - check if it exists
+                    subtarget = constraint.subtarget
+                    
+                    if target.type == 'MESH':
+                        # For mesh targets, check vertex groups
+                        if subtarget not in target.vertex_groups:
+                            is_invalid = True
+                    elif target.type == 'ARMATURE':
+                        # For armature targets, check bones
+                        if subtarget not in target.pose.bones:
+                            is_invalid = True
+            
+            if is_invalid:
+                constraints_to_remove.append(constraint)
+        
+        for constraint in constraints_to_remove:
+            bone.constraints.remove(constraint)
+            removed_count += 1
+    
+    return removed_count
+
+
+def select_bone_chain(armature_obj, start_bones):
+    """
+    Select all bones in the chain(s) starting from the given bones.
+    Only traces downward through connected children.
+    
+    Returns the set of all selected bone names.
+    """
+    all_bones = set()
+    
+    for start_bone in start_bones:
+        # Add the start bone itself
+        all_bones.add(start_bone.name)
+        
+        # Trace downward through all connected children
+        def trace_children(bone):
+            for child in bone.children:
+                if child.bone.use_connect:
+                    all_bones.add(child.name)
+                    trace_children(child)
+        
+        trace_children(start_bone)
+    
+    # Select the bones
+    for bone in armature_obj.pose.bones:
+        bone.bone.select = bone.name in all_bones
+    
+    return all_bones
 
 
 # =============================================================================
@@ -639,12 +733,15 @@ class SKELETALWEAVER_OT_weave(Operator):
         
         props = context.scene.skeletal_weaver_props
         
-        # Clean up previous meshes
-        cleanup_previous_meshes()
+        # Note: Previous meshes are now preserved (not auto-deleted)
+        # Use the cleanup operator manually if needed
+        
+        # STEP 0: Remove existing DAMPED_TRACK constraints to prevent duplicates
+        removed_constraints = remove_damped_track_constraints(selected_bones)
         
         selected_bone_names = [b.name for b in selected_bones]
         
-        # STEP 0: Topology Cleanup (optional)
+        # STEP 0b: Topology Cleanup (optional)
         if props.snap_bones:
             bpy.ops.object.mode_set(mode='EDIT')
             edit_bones = [armature_obj.data.edit_bones[name] for name in selected_bone_names]
@@ -773,6 +870,219 @@ class SKELETALWEAVER_OT_weave(Operator):
 
 
 # =============================================================================
+# UTILITY OPERATORS
+# =============================================================================
+
+class SKELETALWEAVER_OT_clean_bone_names(Operator):
+    bl_idname = "armature.clean_bone_name_suffixes"
+    bl_label = "Clean Bone Name Suffixes"
+    bl_description = "Remove .001, .002, etc. suffixes from all bone names in the armature"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        if context.active_object is None:
+            return False
+        if context.active_object.type != 'ARMATURE':
+            return False
+        return True
+    
+    def execute(self, context):
+        import re
+        
+        armature_obj = context.active_object
+        armature_data = armature_obj.data
+        
+        # Store original mode
+        original_mode = context.mode
+        
+        # Switch to edit mode to rename bones
+        if context.mode != 'EDIT_ARMATURE':
+            bpy.ops.object.mode_set(mode='EDIT')
+        
+        # Pattern to match .001, .002, etc. at the end of the name
+        suffix_pattern = re.compile(r'\.\d{3,}$')
+        
+        renamed_count = 0
+        skipped_count = 0
+        
+        # Get all edit bones
+        edit_bones = armature_data.edit_bones
+        
+        # First pass: collect bones to rename and check for conflicts
+        bones_to_rename = []
+        for bone in edit_bones:
+            match = suffix_pattern.search(bone.name)
+            if match:
+                new_name = suffix_pattern.sub('', bone.name)
+                bones_to_rename.append((bone, bone.name, new_name))
+        
+        # Second pass: rename bones, handling conflicts
+        for bone, old_name, new_name in bones_to_rename:
+            # Check if target name already exists (and is a different bone)
+            if new_name in edit_bones and edit_bones[new_name] != bone:
+                # Name conflict - skip this bone
+                skipped_count += 1
+            else:
+                bone.name = new_name
+                renamed_count += 1
+        
+        # Return to original mode
+        if original_mode == 'POSE':
+            bpy.ops.object.mode_set(mode='POSE')
+        elif original_mode == 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        if skipped_count > 0:
+            self.report({'INFO'}, 
+                        f"Renamed {renamed_count} bones, skipped {skipped_count} (name conflicts)")
+        else:
+            self.report({'INFO'}, f"Renamed {renamed_count} bones")
+        
+        return {'FINISHED'}
+
+
+class SKELETALWEAVER_OT_select_bone_chain(Operator):
+    bl_idname = "armature.select_bone_chain"
+    bl_label = "Select Bone Chain"
+    bl_description = "Select all connected bones in the chain from the currently selected bone(s)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'POSE':
+            return False
+        if context.active_object is None:
+            return False
+        if context.active_object.type != 'ARMATURE':
+            return False
+        if not context.selected_pose_bones:
+            return False
+        return True
+    
+    def execute(self, context):
+        armature_obj = context.active_object
+        selected_bones = list(context.selected_pose_bones)
+        
+        # Select the full chain(s)
+        selected_names = select_bone_chain(armature_obj, selected_bones)
+        
+        self.report({'INFO'}, f"Selected {len(selected_names)} bones in chain")
+        
+        return {'FINISHED'}
+
+
+class SKELETALWEAVER_OT_clear_invalid_constraints(Operator):
+    bl_idname = "armature.clear_invalid_constraints"
+    bl_label = "Clear Invalid Constraints"
+    bl_description = "Remove constraints with missing/invalid targets from selected bones"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'POSE':
+            return False
+        if context.active_object is None:
+            return False
+        if context.active_object.type != 'ARMATURE':
+            return False
+        if not context.selected_pose_bones:
+            return False
+        return True
+    
+    def execute(self, context):
+        selected_bones = list(context.selected_pose_bones)
+        
+        removed_count = remove_invalid_constraints(selected_bones)
+        
+        self.report({'INFO'}, f"Removed {removed_count} invalid constraints")
+        
+        return {'FINISHED'}
+
+
+class SKELETALWEAVER_OT_cleanup_meshes(Operator):
+    bl_idname = "armature.cleanup_weaver_meshes"
+    bl_label = "Delete All Guide Meshes"
+    bl_description = "Delete all Skeletal_Mesh_Guide meshes created by this addon"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        # Check if any guide meshes exist
+        for obj in bpy.data.objects:
+            if obj.name.startswith(MESH_GUIDE_NAME):
+                return True
+        return False
+    
+    def execute(self, context):
+        cleanup_previous_meshes()
+        self.report({'INFO'}, "Deleted all guide meshes")
+        return {'FINISHED'}
+
+
+class SKELETALWEAVER_OT_auto_merge(Operator):
+    bl_idname = "armature.auto_merge_bones"
+    bl_label = "Auto Merge Bones"
+    bl_description = "Automatically connect selected bones to their parents if endpoints are close (auto merge)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'POSE':
+            return False
+        if context.active_object is None:
+            return False
+        if context.active_object.type != 'ARMATURE':
+            return False
+        if not context.selected_pose_bones:
+            return False
+        return True
+    
+    def execute(self, context):
+        armature_obj = context.active_object
+        selected_bones = list(context.selected_pose_bones)
+        
+        if not selected_bones:
+            self.report({'WARNING'}, "No bones selected")
+            return {'CANCELLED'}
+        
+        props = context.scene.skeletal_weaver_props
+        
+        # Store original mode
+        original_mode = context.mode
+        
+        # Switch to edit mode to modify bone connections
+        bpy.ops.object.mode_set(mode='EDIT')
+        
+        # Get edit bones
+        selected_bone_names = [b.name for b in selected_bones]
+        edit_bones = [armature_obj.data.edit_bones[name] for name in selected_bone_names]
+        
+        # Apply auto merge
+        connected_count = 0
+        for bone in edit_bones:
+            if bone.parent and bone.parent.name in selected_bone_names:
+                distance = (bone.head - bone.parent.tail).length
+                if distance < props.snap_threshold:
+                    if not bone.use_connect:
+                        bone.use_connect = True
+                        connected_count += 1
+        
+        # Return to original mode
+        if original_mode == 'POSE':
+            bpy.ops.object.mode_set(mode='POSE')
+        elif original_mode == 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        if connected_count > 0:
+            self.report({'INFO'}, f"Auto merged {connected_count} bone(s)")
+        else:
+            self.report({'INFO'}, "No bones needed merging (all already connected or too far apart)")
+        
+        return {'FINISHED'}
+
+
+# =============================================================================
 # UI PANEL
 # =============================================================================
 
@@ -801,12 +1111,19 @@ class SKELETALWEAVER_PT_main(Panel):
         selected_count = len(context.selected_pose_bones) if context.selected_pose_bones else 0
         layout.label(text=f"Selected Bones: {selected_count}", icon='BONE_DATA')
         
+        # Quick selection button at the top
+        row = layout.row(align=True)
+        row.operator("armature.select_bone_chain", text="Select Bone Chain", 
+                     icon='LINKED')
+        
         layout.separator()
         
         # Topology section
         box = layout.box()
         box.label(text="Topology", icon='SNAP_ON')
         col = box.column(align=True)
+        col.operator("armature.auto_merge_bones", text="Auto Merge Bones", 
+                     icon='LINKED')
         col.prop(props, "snap_bones")
         if props.snap_bones:
             col.prop(props, "snap_threshold")
@@ -836,6 +1153,19 @@ class SKELETALWEAVER_PT_main(Panel):
         row.scale_y = 1.5
         row.operator("armature.skeletal_weave", text="Weave & Parent Mesh", 
                      icon='OUTLINER_OB_MESH')
+        
+        layout.separator()
+        
+        # Utilities section
+        box = layout.box()
+        box.label(text="Utilities", icon='TOOL_SETTINGS')
+        col = box.column(align=True)
+        col.operator("armature.clear_invalid_constraints", text="Clear Invalid Constraints", 
+                     icon='X')
+        col.operator("armature.clean_bone_name_suffixes", text="Clean Bone Name Suffixes", 
+                     icon='BRUSH_DATA')
+        col.operator("armature.cleanup_weaver_meshes", text="Delete All Guide Meshes", 
+                     icon='TRASH')
 
 
 # =============================================================================
@@ -894,6 +1224,11 @@ class SkeletalWeaverProperties(PropertyGroup):
 classes = (
     SkeletalWeaverProperties,
     SKELETALWEAVER_OT_weave,
+    SKELETALWEAVER_OT_clean_bone_names,
+    SKELETALWEAVER_OT_select_bone_chain,
+    SKELETALWEAVER_OT_clear_invalid_constraints,
+    SKELETALWEAVER_OT_cleanup_meshes,
+    SKELETALWEAVER_OT_auto_merge,
     SKELETALWEAVER_PT_main,
 )
 
