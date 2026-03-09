@@ -20,6 +20,8 @@ bl_info = {
 }
 
 MESH_GUIDE_NAME = "Skeletal_Mesh_Guide"
+WEAVER_PRE_CONSTRAINT_MATRIX = "skeletal_weaver_pre_constraint_matrix_basis"
+WEAVER_CONSTRAINT_PREFIX = "SW_DampedTrack"
 
 
 # =============================================================================
@@ -56,6 +58,10 @@ def remove_damped_track_constraints(pose_bones):
         for constraint in constraints_to_remove:
             bone.constraints.remove(constraint)
             removed_count += 1
+
+        # If this bone had Skeletal Weaver constraints, restore stored pre-constraint pose.
+        if constraints_to_remove:
+            restore_pre_constraint_pose(bone)
     
     return removed_count
 
@@ -103,6 +109,9 @@ def remove_invalid_constraints(pose_bones):
         for constraint in constraints_to_remove:
             bone.constraints.remove(constraint)
             removed_count += 1
+
+        if constraints_to_remove:
+            restore_pre_constraint_pose(bone)
     
     return removed_count
 
@@ -666,11 +675,14 @@ def add_bone_constraints(mesh_obj, bone_matrix, max_rows, max_cols):
                 
                 # Check if vertex group exists for this bone
                 if bone.name in mesh_obj.vertex_groups:
+                    store_pre_constraint_pose(bone)
+
                     # Add DAMPED_TRACK constraint
                     constraint = bone.constraints.new('DAMPED_TRACK')
                     constraint.target = mesh_obj
                     constraint.subtarget = bone.name
                     constraint.track_axis = 'TRACK_Y'
+                    constraint.name = f"{WEAVER_CONSTRAINT_PREFIX}_{bone.name}"
                     
                     added_constraints.append((bone.name, constraint.name))
     
@@ -695,6 +707,65 @@ def parent_mesh_to_armature(mesh_obj, armature_obj, parent_bone):
     mesh_obj.matrix_world = original_matrix
 
 
+def _flatten_matrix4x4(matrix):
+    return [matrix[r][c] for r in range(4) for c in range(4)]
+
+
+def _matrix4x4_from_flat(values):
+    return Matrix((
+        (values[0], values[1], values[2], values[3]),
+        (values[4], values[5], values[6], values[7]),
+        (values[8], values[9], values[10], values[11]),
+        (values[12], values[13], values[14], values[15]),
+    ))
+
+
+def store_pre_constraint_pose(pose_bone):
+    """
+    Save pose bone matrix_basis before Skeletal Weaver constraints are applied.
+    """
+    if WEAVER_PRE_CONSTRAINT_MATRIX in pose_bone:
+        return
+    pose_bone[WEAVER_PRE_CONSTRAINT_MATRIX] = _flatten_matrix4x4(pose_bone.matrix_basis.copy())
+
+
+def restore_pre_constraint_pose(pose_bone):
+    """
+    Restore matrix_basis saved by store_pre_constraint_pose().
+    """
+    if WEAVER_PRE_CONSTRAINT_MATRIX not in pose_bone:
+        return False
+
+    matrix_data = list(pose_bone[WEAVER_PRE_CONSTRAINT_MATRIX])
+    del pose_bone[WEAVER_PRE_CONSTRAINT_MATRIX]
+
+    if len(matrix_data) != 16:
+        return False
+
+    pose_bone.matrix_basis = _matrix4x4_from_flat(matrix_data)
+    return True
+
+
+def is_weaver_damped_track_constraint(pose_bone, constraint, guide_object_names):
+    """
+    Identify DAMPED_TRACK constraints created by Skeletal Weaver.
+    """
+    if constraint.type != 'DAMPED_TRACK':
+        return False
+
+    if constraint.name.startswith(WEAVER_CONSTRAINT_PREFIX):
+        return True
+
+    target = getattr(constraint, 'target', None)
+    subtarget = getattr(constraint, 'subtarget', "")
+
+    if target is not None:
+        return target.name in guide_object_names and subtarget == pose_bone.name
+
+    # Fallback for broken references: if we have stored pre-constraint pose, this likely belongs to us.
+    return subtarget == pose_bone.name and WEAVER_PRE_CONSTRAINT_MATRIX in pose_bone
+
+
 def cleanup_previous_meshes():
     """
     Remove previous Skeletal_Mesh_Guide objects if they exist.
@@ -702,11 +773,35 @@ def cleanup_previous_meshes():
     objects_to_remove = [obj for obj in bpy.data.objects 
                          if obj.name.startswith(MESH_GUIDE_NAME)]
     
+    guide_object_names = {obj.name for obj in objects_to_remove}
+
+    removed_constraints = 0
+    restored_bones = 0
+
+    for armature_obj in bpy.data.objects:
+        if armature_obj.type != 'ARMATURE' or armature_obj.pose is None:
+            continue
+
+        for pose_bone in armature_obj.pose.bones:
+            constraints_to_remove = [
+                c for c in pose_bone.constraints
+                if is_weaver_damped_track_constraint(pose_bone, c, guide_object_names)
+            ]
+
+            for constraint in constraints_to_remove:
+                pose_bone.constraints.remove(constraint)
+                removed_constraints += 1
+
+            if constraints_to_remove and restore_pre_constraint_pose(pose_bone):
+                restored_bones += 1
+
     for obj in objects_to_remove:
         mesh_data = obj.data
         bpy.data.objects.remove(obj, do_unlink=True)
         if mesh_data and mesh_data.users == 0:
             bpy.data.meshes.remove(mesh_data)
+
+    return len(objects_to_remove), removed_constraints, restored_bones
 
 
 # =============================================================================
@@ -1021,8 +1116,12 @@ class SKELETALWEAVER_OT_cleanup_meshes(Operator):
         return False
     
     def execute(self, context):
-        cleanup_previous_meshes()
-        self.report({'INFO'}, "Deleted all guide meshes")
+        deleted_meshes, removed_constraints, restored_bones = cleanup_previous_meshes()
+        self.report(
+            {'INFO'},
+            f"Deleted {deleted_meshes} guide mesh(es), removed {removed_constraints} constraint(s), "
+            f"restored {restored_bones} bone pose(s)"
+        )
         return {'FINISHED'}
 
 
