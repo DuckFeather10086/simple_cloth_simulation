@@ -131,7 +131,13 @@ def select_bone_chain(armature_obj, start_bones):
     
     # Select the bones
     for bone in armature_obj.pose.bones:
-        bone.bone.select = bone.name in all_bones
+        is_selected = bone.name in all_bones
+        if hasattr(bone, "select"):
+            # Blender 5.0+: bone selection lives on PoseBone.
+            bone.select = is_selected
+        else:
+            # Blender <= 4.x: selection is on Bone.
+            bone.bone.select = is_selected
     
     return all_bones
 
