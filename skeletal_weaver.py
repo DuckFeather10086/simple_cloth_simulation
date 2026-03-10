@@ -2,9 +2,10 @@
 
 import bpy
 import bmesh
-from bpy.props import FloatProperty, BoolProperty, PointerProperty
+from bpy.props import FloatProperty, BoolProperty, PointerProperty, EnumProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector, Matrix
+from math import exp
 from collections import defaultdict
 
 bl_info = {
@@ -598,7 +599,37 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
 # VERTEX GROUPS & PARENTING
 # =============================================================================
 
-def create_vertex_groups(mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max_cols):
+def evaluate_pin_falloff(normalized_distance, pattern, strength, min_weight):
+    """
+    Compute pin weight where 0 = chain top, 1 = chain bottom.
+    """
+    t = max(0.0, min(1.0, normalized_distance))
+    k = max(0.01, strength)
+
+    if pattern == 'LINEAR':
+        base_weight = 1.0 - t
+    elif pattern == 'EXPONENTIAL':
+        start = 1.0
+        end = exp(-k)
+        value = exp(-k * t)
+        base_weight = (value - end) / (start - end) if start != end else 0.0
+    elif pattern == 'ROOT':
+        base_weight = 1.0 - (t ** 0.5)
+    else:
+        # Default: inverse-style drop (fast near top, slower near bottom).
+        start = 1.0
+        end = 1.0 / (1.0 + k)
+        value = 1.0 / (1.0 + (k * t))
+        base_weight = (value - end) / (start - end) if start != end else 0.0
+
+    base_weight = max(0.0, min(1.0, base_weight))
+    return min_weight + ((1.0 - min_weight) * base_weight)
+
+
+def create_vertex_groups(
+    mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max_cols,
+    pin_falloff_pattern='INVERSE', pin_falloff_strength=4.0, pin_min_weight=0.05
+):
     """
     Create vertex groups for rigging.
     """
@@ -606,6 +637,7 @@ def create_vertex_groups(mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max
     
     pin_group = mesh_obj.vertex_groups.new(name="Pin")
     mesh = mesh_obj.data
+    pin_weights_by_vert = {}
     
     coord_to_idx = {}
     for idx, vert in enumerate(mesh.vertices):
@@ -620,12 +652,18 @@ def create_vertex_groups(mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max
                 
                 if coord_key in coord_to_idx:
                     vert_idx = coord_to_idx[coord_key]
+                    normalized_distance = row / (total_rows - 1) if total_rows > 1 else 0.0
+                    pin_weight = evaluate_pin_falloff(
+                        normalized_distance,
+                        pin_falloff_pattern,
+                        pin_falloff_strength,
+                        pin_min_weight
+                    )
+                    pin_weights_by_vert[vert_idx] = max(pin_weights_by_vert.get(vert_idx, 0.0), pin_weight)
                     
                     # Row 0 is the first HEAD position - Pin only, no bone assignment
                     # (This vertex is pinned, no bone tracks to it)
-                    if row == 0:
-                        pin_group.add([vert_idx], 1.0, 'REPLACE')
-                    else:
+                    if row > 0:
                         # Row N (N > 0) is the TAIL position of bone[N-1]
                         # So assign to bone_matrix[col][N-1]
                         prev_row = row - 1
@@ -649,6 +687,9 @@ def create_vertex_groups(mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max
                             else:
                                 bone_group = mesh_obj.vertex_groups[group_name]
                             bone_group.add([vert_idx], 1.0, 'REPLACE')
+
+    for vert_idx, weight in pin_weights_by_vert.items():
+        pin_group.add([vert_idx], weight, 'REPLACE')
 
 
 def add_cloth_modifier(mesh_obj):
@@ -903,7 +944,10 @@ class SKELETALWEAVER_OT_weave(Operator):
             # Create vertex groups
             if props.create_vertex_groups:
                 create_vertex_groups(mesh_obj, vert_matrix, bone_matrix_for_groups, 
-                                   max_rows, max_cols_for_groups)
+                                   max_rows, max_cols_for_groups,
+                                   props.pin_falloff_pattern,
+                                   props.pin_falloff_strength,
+                                   props.pin_min_weight)
             
             # Parent to appropriate bone
             parent_mesh_to_armature(mesh_obj, armature_obj, mesh_group['parent_bone'])
@@ -1250,6 +1294,11 @@ class SKELETALWEAVER_PT_main(Panel):
         col = box.column(align=True)
         col.prop(props, "add_cloth_modifier")
         col.prop(props, "add_bone_constraints")
+        col.separator()
+        col.label(text="Pin Falloff", icon='FCURVE')
+        col.prop(props, "pin_falloff_pattern", text="Pattern")
+        col.prop(props, "pin_falloff_strength")
+        col.prop(props, "pin_min_weight")
         
         layout.separator()
         
@@ -1319,6 +1368,37 @@ class SkeletalWeaverProperties(PropertyGroup):
         name="Add Bone Constraints",
         description="Add DAMPED_TRACK constraints to bones targeting mesh vertices",
         default=True,
+    )
+
+    pin_falloff_pattern: EnumProperty(
+        name="Pin Falloff Pattern",
+        description="How pin weight decreases from top (x=0) to bottom (x=1)",
+        items=[
+            ('INVERSE', "Inverse", "Fast drop near top, slower near bottom (recommended)"),
+            ('EXPONENTIAL', "Exponential", "Strong early damping with smooth tail"),
+            ('ROOT', "Root", "Very fast initial drop, then long soft tail"),
+            ('LINEAR', "Linear", "Uniform decrease from top to bottom"),
+        ],
+        default='INVERSE',
+    )
+
+    pin_falloff_strength: FloatProperty(
+        name="Pin Falloff Strength",
+        description="Controls how quickly the weight drops near the top",
+        default=4.0,
+        min=0.01,
+        max=20.0,
+        precision=2,
+    )
+
+    pin_min_weight: FloatProperty(
+        name="Pin Min Weight",
+        description="Minimum pin weight at the chain tail",
+        default=0.05,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
     )
 
 
