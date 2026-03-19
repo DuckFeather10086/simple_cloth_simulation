@@ -23,6 +23,7 @@ bl_info = {
 MESH_GUIDE_NAME = "Skeletal_Mesh_Guide"
 WEAVER_PRE_CONSTRAINT_MATRIX = "skeletal_weaver_pre_constraint_matrix_basis"
 WEAVER_CONSTRAINT_PREFIX = "SW_DampedTrack"
+PIN_FALLOFF_BRUSH_NAME = "SkeletalWeaver_PinFalloff"
 
 
 # =============================================================================
@@ -599,7 +600,9 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
 # VERTEX GROUPS & PARENTING
 # =============================================================================
 
-def evaluate_pin_falloff(normalized_distance, pattern, strength, min_weight):
+def evaluate_pin_falloff(
+    normalized_distance, pattern, strength, min_weight, custom_curve_mapping=None
+):
     """
     Compute pin weight where 0 = chain top, 1 = chain bottom.
     """
@@ -615,6 +618,11 @@ def evaluate_pin_falloff(normalized_distance, pattern, strength, min_weight):
         base_weight = (value - end) / (start - end) if start != end else 0.0
     elif pattern == 'ROOT':
         base_weight = 1.0 - (t ** 0.5)
+    elif pattern == 'CUSTOM':
+        if custom_curve_mapping is not None:
+            base_weight = custom_curve_mapping.evaluate(custom_curve_mapping.curves[0], t)
+        else:
+            base_weight = 1.0 - t
     else:
         # Default: inverse-style drop (fast near top, slower near bottom).
         start = 1.0
@@ -626,18 +634,36 @@ def evaluate_pin_falloff(normalized_distance, pattern, strength, min_weight):
     return min_weight + ((1.0 - min_weight) * base_weight)
 
 
+def get_or_create_pin_falloff_brush():
+    """
+    Returns a dedicated hidden brush that stores GUI-editable falloff curve data.
+    """
+    brush = bpy.data.brushes.get(PIN_FALLOFF_BRUSH_NAME)
+    if brush is None:
+        brush = bpy.data.brushes.new(PIN_FALLOFF_BRUSH_NAME, mode='SCULPT')
+        brush.use_fake_user = True
+    return brush
+
+
 def create_vertex_groups(
     mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max_cols,
-    pin_falloff_pattern='INVERSE', pin_falloff_strength=4.0, pin_min_weight=0.05
+    pin_use_falloff=True,
+    pin_falloff_pattern='INVERSE', pin_falloff_strength=4.0, pin_min_weight=0.05,
+    pin_custom_curve_mapping=None
 ):
     """
     Create vertex groups for rigging.
+    pin_use_falloff: if True, pin weight uses falloff; if False, only top row = 1, rest = 0 (free swing).
     """
     total_rows = max_rows + 1
     
     pin_group = mesh_obj.vertex_groups.new(name="Pin")
     mesh = mesh_obj.data
     pin_weights_by_vert = {}
+    bone_assignment_by_vert = {}
+    
+    if pin_use_falloff and pin_falloff_pattern == 'CUSTOM' and pin_custom_curve_mapping is not None:
+        pin_custom_curve_mapping.initialize()
     
     coord_to_idx = {}
     for idx, vert in enumerate(mesh.vertices):
@@ -652,13 +678,18 @@ def create_vertex_groups(
                 
                 if coord_key in coord_to_idx:
                     vert_idx = coord_to_idx[coord_key]
-                    normalized_distance = row / (total_rows - 1) if total_rows > 1 else 0.0
-                    pin_weight = evaluate_pin_falloff(
-                        normalized_distance,
-                        pin_falloff_pattern,
-                        pin_falloff_strength,
-                        pin_min_weight
-                    )
+                    if pin_use_falloff:
+                        normalized_distance = row / (total_rows - 1) if total_rows > 1 else 0.0
+                        pin_weight = evaluate_pin_falloff(
+                            normalized_distance,
+                            pin_falloff_pattern,
+                            pin_falloff_strength,
+                            pin_min_weight,
+                            pin_custom_curve_mapping
+                        )
+                    else:
+                        # Top-only pin: row 0 = 1, all others = 0 (free swing).
+                        pin_weight = 1.0 if row == 0 else 0.0
                     pin_weights_by_vert[vert_idx] = max(pin_weights_by_vert.get(vert_idx, 0.0), pin_weight)
                     
                     # Row 0 is the first HEAD position - Pin only, no bone assignment
@@ -681,15 +712,20 @@ def create_vertex_groups(
                                         break
                         
                         if bone is not None:
-                            group_name = bone.name
-                            if group_name not in mesh_obj.vertex_groups:
-                                bone_group = mesh_obj.vertex_groups.new(name=group_name)
-                            else:
-                                bone_group = mesh_obj.vertex_groups[group_name]
-                            bone_group.add([vert_idx], 1.0, 'REPLACE')
+                            # Keep bone influence strictly one-to-one per vertex.
+                            if vert_idx not in bone_assignment_by_vert:
+                                bone_assignment_by_vert[vert_idx] = bone.name
 
     for vert_idx, weight in pin_weights_by_vert.items():
         pin_group.add([vert_idx], weight, 'REPLACE')
+
+    for vert_idx, group_name in bone_assignment_by_vert.items():
+        if group_name not in mesh_obj.vertex_groups:
+            bone_group = mesh_obj.vertex_groups.new(name=group_name)
+        else:
+            bone_group = mesh_obj.vertex_groups[group_name]
+        # Bone driving weights must remain full-strength; falloff is Pin-only.
+        bone_group.add([vert_idx], 1.0, 'REPLACE')
 
 
 def add_cloth_modifier(mesh_obj):
@@ -943,11 +979,16 @@ class SKELETALWEAVER_OT_weave(Operator):
             
             # Create vertex groups
             if props.create_vertex_groups:
+                custom_curve_mapping = None
+                if props.pin_falloff_pattern == 'CUSTOM':
+                    custom_curve_mapping = get_or_create_pin_falloff_brush().curve_distance_falloff
                 create_vertex_groups(mesh_obj, vert_matrix, bone_matrix_for_groups, 
                                    max_rows, max_cols_for_groups,
+                                   props.pin_use_falloff,
                                    props.pin_falloff_pattern,
                                    props.pin_falloff_strength,
-                                   props.pin_min_weight)
+                                   props.pin_min_weight,
+                                   custom_curve_mapping)
             
             # Parent to appropriate bone
             parent_mesh_to_armature(mesh_obj, armature_obj, mesh_group['parent_bone'])
@@ -1295,10 +1336,17 @@ class SKELETALWEAVER_PT_main(Panel):
         col.prop(props, "add_cloth_modifier")
         col.prop(props, "add_bone_constraints")
         col.separator()
-        col.label(text="Pin Falloff", icon='FCURVE')
-        col.prop(props, "pin_falloff_pattern", text="Pattern")
-        col.prop(props, "pin_falloff_strength")
-        col.prop(props, "pin_min_weight")
+        col.label(text="Pin", icon='FCURVE')
+        col.prop(props, "pin_use_falloff", text="Pin Falloff (else top-only free swing)")
+        if props.pin_use_falloff:
+            col.prop(props, "pin_falloff_pattern", text="Pattern")
+        if props.pin_use_falloff and props.pin_falloff_pattern == 'CUSTOM':
+            brush = get_or_create_pin_falloff_brush()
+            col.template_curve_mapping(brush, "curve_distance_falloff")
+        elif props.pin_use_falloff:
+            col.prop(props, "pin_falloff_strength")
+        if props.pin_use_falloff:
+            col.prop(props, "pin_min_weight")
         
         layout.separator()
         
@@ -1370,6 +1418,12 @@ class SkeletalWeaverProperties(PropertyGroup):
         default=True,
     )
 
+    pin_use_falloff: BoolProperty(
+        name="Pin Falloff",
+        description="Use falloff for Pin group (weight decreases down chain). Off = only top vertices pinned (1), rest free (0)",
+        default=True,
+    )
+
     pin_falloff_pattern: EnumProperty(
         name="Pin Falloff Pattern",
         description="How pin weight decreases from top (x=0) to bottom (x=1)",
@@ -1378,6 +1432,7 @@ class SkeletalWeaverProperties(PropertyGroup):
             ('EXPONENTIAL', "Exponential", "Strong early damping with smooth tail"),
             ('ROOT', "Root", "Very fast initial drop, then long soft tail"),
             ('LINEAR', "Linear", "Uniform decrease from top to bottom"),
+            ('CUSTOM', "Custom Curve", "User-defined falloff curve via control points"),
         ],
         default='INVERSE',
     )
