@@ -11,7 +11,7 @@ from collections import defaultdict
 bl_info = {
     "name": "Skeletal Weaver",
     "author": "Duck Feather",
-    "version": (2, 2, 0),
+    "version": (2, 3, 0),
     "blender": (2, 80, 0),
     "location": "Pose Mode > Sidebar > Skeletal Weaver",
     "description": "Generates helper meshes (grid/web) based on selected bones in an Armature",
@@ -24,6 +24,8 @@ MESH_GUIDE_NAME = "Skeletal_Mesh_Guide"
 WEAVER_PRE_CONSTRAINT_MATRIX = "skeletal_weaver_pre_constraint_matrix_basis"
 WEAVER_CONSTRAINT_PREFIX = "SW_DampedTrack"
 PIN_FALLOFF_BRUSH_NAME = "SkeletalWeaver_PinFalloff"
+HOOK_GROUP_HEAD = "SW_Hook_Head"
+HOOK_GROUP_TAIL = "SW_Hook_Tail"
 
 
 # =============================================================================
@@ -467,6 +469,206 @@ def create_ribbon_mesh(coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_wi
     return obj, coord_vert_matrix, expanded_bone_matrix, 2
 
 
+def create_extruded_ribbon_mesh(
+    coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_width, armature_obj
+):
+    """
+    Same strip as create_ribbon_mesh, then extruded along face normals by ribbon_width
+    so the cross-section is square (width × thickness).
+    Returns mesh object, coord_vert_matrix (front shell coords), expanded bone matrix,
+    column count, and vert_indices_matrix[col][row] = list of mesh vertex indices
+    (front then back) for explicit weight assignment.
+    """
+    mesh = bpy.data.meshes.new(mesh_name + "_mesh")
+    bm = bmesh.new()
+
+    total_rows = max_rows + 1
+    front = [[None for _ in range(total_rows)] for _ in range(2)]
+    coords = coord_matrix[0]
+
+    first_bone = bone_matrix[0][0]
+    if first_bone is not None:
+        bone_world_matrix = armature_obj.matrix_world @ first_bone.bone.matrix_local
+        offset_dir = Vector(
+            (bone_world_matrix[0][0], bone_world_matrix[0][1], bone_world_matrix[0][2])
+        ).normalized()
+    else:
+        offset_dir = Vector((1, 0, 0))
+
+    half_width = ribbon_width / 2.0
+
+    for row in range(total_rows):
+        coord = coords[row]
+        if coord is not None:
+            front[0][row] = bm.verts.new(coord - offset_dir * half_width)
+            front[1][row] = bm.verts.new(coord + offset_dir * half_width)
+
+    bm.verts.ensure_lookup_table()
+
+    extrude_vec = Vector((0.0, 0.0, 1.0))
+    for row in range(1, total_rows):
+        if coords[0] is not None and coords[row] is not None:
+            seg = coords[row] - coords[0]
+            if seg.length > 1e-8:
+                extrude_vec = seg.normalized().cross(offset_dir).normalized()
+                break
+
+    if total_rows >= 2 and front[0][0] and front[1][0] and front[0][1]:
+        v_tl = front[0][0].co
+        v_tr = front[1][0].co
+        v_bl = front[0][1].co
+        n = (v_tr - v_tl).cross(v_bl - v_tl)
+        if n.length > 1e-10:
+            extrude_vec = n.normalized()
+
+    back = [[None for _ in range(total_rows)] for _ in range(2)]
+    for row in range(total_rows):
+        for col in range(2):
+            if front[col][row] is not None:
+                back[col][row] = bm.verts.new(
+                    front[col][row].co + extrude_vec * ribbon_width
+                )
+
+    bm.verts.ensure_lookup_table()
+
+    for row in range(total_rows - 1):
+        for col in range(2):
+            v1 = front[col][row]
+            v2 = front[col][row + 1]
+            if v1 is not None and v2 is not None:
+                try:
+                    bm.edges.new((v1, v2))
+                except ValueError:
+                    pass
+
+    for row in range(total_rows - 1):
+        for col in range(2):
+            v1 = back[col][row]
+            v2 = back[col][row + 1]
+            if v1 is not None and v2 is not None:
+                try:
+                    bm.edges.new((v1, v2))
+                except ValueError:
+                    pass
+
+    for row in range(total_rows):
+        v_l = front[0][row]
+        v_r = front[1][row]
+        if v_l is not None and v_r is not None:
+            try:
+                bm.edges.new((v_l, v_r))
+            except ValueError:
+                pass
+
+    for row in range(total_rows):
+        v_l = back[0][row]
+        v_r = back[1][row]
+        if v_l is not None and v_r is not None:
+            try:
+                bm.edges.new((v_l, v_r))
+            except ValueError:
+                pass
+
+    for row in range(total_rows - 1):
+        v_tl = front[0][row]
+        v_tr = front[1][row]
+        v_bl = front[0][row + 1]
+        v_br = front[1][row + 1]
+        if all(v is not None for v in (v_tl, v_tr, v_bl, v_br)):
+            try:
+                bm.faces.new((v_tl, v_tr, v_br, v_bl))
+            except ValueError:
+                pass
+
+    for row in range(total_rows - 1):
+        v_tl = back[0][row + 1]
+        v_tr = back[1][row + 1]
+        v_bl = back[0][row]
+        v_br = back[1][row]
+        if all(v is not None for v in (v_tl, v_tr, v_bl, v_br)):
+            try:
+                bm.faces.new((v_tl, v_tr, v_br, v_bl))
+            except ValueError:
+                pass
+
+    for row in range(total_rows - 1):
+        v_fl = front[0][row]
+        v_fr = front[0][row + 1]
+        v_bl = back[0][row]
+        v_br = back[0][row + 1]
+        if all(v is not None for v in (v_fl, v_fr, v_br, v_bl)):
+            try:
+                bm.faces.new((v_fl, v_fr, v_br, v_bl))
+            except ValueError:
+                pass
+
+        v_fl = front[1][row + 1]
+        v_fr = front[1][row]
+        v_bl = back[1][row + 1]
+        v_br = back[1][row]
+        if all(v is not None for v in (v_fl, v_fr, v_br, v_bl)):
+            try:
+                bm.faces.new((v_fl, v_fr, v_br, v_bl))
+            except ValueError:
+                pass
+
+    first_row = None
+    last_row = None
+    for row in range(total_rows):
+        if coords[row] is not None:
+            if first_row is None:
+                first_row = row
+            last_row = row
+
+    if first_row is not None and last_row is not None:
+        f0 = front[0][first_row]
+        f1 = front[1][first_row]
+        b0 = back[0][first_row]
+        b1 = back[1][first_row]
+        if all(v is not None for v in (f0, f1, b1, b0)):
+            try:
+                bm.faces.new((f0, f1, b1, b0))
+            except ValueError:
+                pass
+
+        f0 = front[0][last_row]
+        f1 = front[1][last_row]
+        b0 = back[0][last_row]
+        b1 = back[1][last_row]
+        if all(v is not None for v in (f0, b0, b1, f1)):
+            try:
+                bm.faces.new((f0, b0, b1, f1))
+            except ValueError:
+                pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+
+    coord_vert_matrix = [[None for _ in range(total_rows)] for _ in range(2)]
+    for col in range(2):
+        for row in range(total_rows):
+            if front[col][row] is not None:
+                coord_vert_matrix[col][row] = front[col][row].co.copy()
+
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    vert_indices_matrix = [[[] for _ in range(total_rows)] for _ in range(2)]
+    for col in range(2):
+        for row in range(total_rows):
+            if front[col][row] is not None:
+                vert_indices_matrix[col][row].append(front[col][row].index)
+            if back[col][row] is not None:
+                vert_indices_matrix[col][row].append(back[col][row].index)
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+    obj = bpy.data.objects.new(mesh_name, mesh)
+    bpy.context.collection.objects.link(obj)
+    expanded_bone_matrix = [bone_matrix[0], bone_matrix[0]]
+    return obj, coord_vert_matrix, expanded_bone_matrix, 2, vert_indices_matrix
+
+
 def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
     """
     Generate mesh using BMesh with proper weaving logic.
@@ -649,72 +851,86 @@ def create_vertex_groups(
     mesh_obj, coord_vert_matrix, bone_matrix, max_rows, max_cols,
     pin_use_falloff=True,
     pin_falloff_pattern='INVERSE', pin_falloff_strength=4.0, pin_min_weight=0.05,
-    pin_custom_curve_mapping=None
+    pin_custom_curve_mapping=None,
+    pin_group_name="Pin",
+    vert_indices_matrix=None,
 ):
     """
-    Create vertex groups for rigging.
-    pin_use_falloff: if True, pin weight uses falloff; if False, only top row = 1, rest = 0 (free swing).
+    Create vertex groups for rigging (Pin/Goal mass + per-bone groups).
+    pin_use_falloff: if True, pin weight uses falloff or TOP_ONLY pattern; if False,
+    only top row = 1, rest = 0 (free swing), ignoring pattern.
+    vert_indices_matrix: optional [col][row] -> list of mesh vertex indices (for extruded meshes).
     """
     total_rows = max_rows + 1
-    
-    pin_group = mesh_obj.vertex_groups.new(name="Pin")
+
+    pin_group = mesh_obj.vertex_groups.new(name=pin_group_name)
     mesh = mesh_obj.data
     pin_weights_by_vert = {}
     bone_assignment_by_vert = {}
-    
-    if pin_use_falloff and pin_falloff_pattern == 'CUSTOM' and pin_custom_curve_mapping is not None:
+
+    use_custom_curve = (
+        pin_use_falloff
+        and pin_falloff_pattern == 'CUSTOM'
+        and pin_custom_curve_mapping is not None
+    )
+    if use_custom_curve:
         pin_custom_curve_mapping.initialize()
-    
+
     coord_to_idx = {}
-    for idx, vert in enumerate(mesh.vertices):
-        coord_key = (round(vert.co.x, 5), round(vert.co.y, 5), round(vert.co.z, 5))
-        coord_to_idx[coord_key] = idx
-    
+    if vert_indices_matrix is None:
+        for idx, vert in enumerate(mesh.vertices):
+            coord_key = (round(vert.co.x, 5), round(vert.co.y, 5), round(vert.co.z, 5))
+            coord_to_idx[coord_key] = idx
+
+    def pin_weight_for_row(row):
+        if not pin_use_falloff:
+            return 1.0 if row == 0 else 0.0
+        if pin_falloff_pattern == 'TOP_ONLY':
+            return 1.0 if row == 0 else 0.0
+        normalized_distance = row / (total_rows - 1) if total_rows > 1 else 0.0
+        return evaluate_pin_falloff(
+            normalized_distance,
+            pin_falloff_pattern,
+            pin_falloff_strength,
+            pin_min_weight,
+            pin_custom_curve_mapping,
+        )
+
     for col in range(max_cols):
         for row in range(total_rows):
-            orig_coord = coord_vert_matrix[col][row]
-            if orig_coord is not None:
+            if vert_indices_matrix is not None:
+                idxs = vert_indices_matrix[col][row]
+                if not idxs:
+                    continue
+            else:
+                orig_coord = coord_vert_matrix[col][row]
+                if orig_coord is None:
+                    continue
                 coord_key = (round(orig_coord.x, 5), round(orig_coord.y, 5), round(orig_coord.z, 5))
-                
-                if coord_key in coord_to_idx:
-                    vert_idx = coord_to_idx[coord_key]
-                    if pin_use_falloff:
-                        normalized_distance = row / (total_rows - 1) if total_rows > 1 else 0.0
-                        pin_weight = evaluate_pin_falloff(
-                            normalized_distance,
-                            pin_falloff_pattern,
-                            pin_falloff_strength,
-                            pin_min_weight,
-                            pin_custom_curve_mapping
-                        )
-                    else:
-                        # Top-only pin: row 0 = 1, all others = 0 (free swing).
-                        pin_weight = 1.0 if row == 0 else 0.0
-                    pin_weights_by_vert[vert_idx] = max(pin_weights_by_vert.get(vert_idx, 0.0), pin_weight)
-                    
-                    # Row 0 is the first HEAD position - Pin only, no bone assignment
-                    # (This vertex is pinned, no bone tracks to it)
-                    if row > 0:
-                        # Row N (N > 0) is the TAIL position of bone[N-1]
-                        # So assign to bone_matrix[col][N-1]
-                        prev_row = row - 1
-                        bone = None
-                        
-                        if prev_row < max_rows:
-                            bone = bone_matrix[col][prev_row]
-                        
-                        # If bone at prev_row is None, find last valid bone
-                        if bone is None:
-                            for r in range(prev_row - 1, -1, -1):
-                                if r < max_rows:
-                                    bone = bone_matrix[col][r]
-                                    if bone is not None:
-                                        break
-                        
-                        if bone is not None:
-                            # Keep bone influence strictly one-to-one per vertex.
-                            if vert_idx not in bone_assignment_by_vert:
-                                bone_assignment_by_vert[vert_idx] = bone.name
+                if coord_key not in coord_to_idx:
+                    continue
+                idxs = [coord_to_idx[coord_key]]
+
+            pin_weight = pin_weight_for_row(row)
+            for vert_idx in idxs:
+                pin_weights_by_vert[vert_idx] = max(
+                    pin_weights_by_vert.get(vert_idx, 0.0), pin_weight
+                )
+
+                if row > 0:
+                    prev_row = row - 1
+                    bone = None
+                    if prev_row < max_rows:
+                        bone = bone_matrix[col][prev_row]
+                    if bone is None:
+                        for r in range(prev_row - 1, -1, -1):
+                            if r < max_rows:
+                                bone = bone_matrix[col][r]
+                                if bone is not None:
+                                    break
+                    if bone is not None:
+                        if vert_idx not in bone_assignment_by_vert:
+                            bone_assignment_by_vert[vert_idx] = bone.name
 
     for vert_idx, weight in pin_weights_by_vert.items():
         pin_group.add([vert_idx], weight, 'REPLACE')
@@ -724,7 +940,6 @@ def create_vertex_groups(
             bone_group = mesh_obj.vertex_groups.new(name=group_name)
         else:
             bone_group = mesh_obj.vertex_groups[group_name]
-        # Bone driving weights must remain full-strength; falloff is Pin-only.
         bone_group.add([vert_idx], 1.0, 'REPLACE')
 
 
@@ -735,6 +950,97 @@ def add_cloth_modifier(mesh_obj):
     cloth_mod = mesh_obj.modifiers.new("Cloth", 'CLOTH')
     cloth_mod.settings.vertex_group_mass = "Pin"
     return cloth_mod
+
+
+def _set_softbody_goal_vertex_group(settings, group_name):
+    if hasattr(settings, "vertex_group_goal"):
+        settings.vertex_group_goal = group_name
+    elif hasattr(settings, "goal_vertex_group"):
+        settings.goal_vertex_group = group_name
+
+
+def add_softbody_modifier(mesh_obj, goal_group_name="Goal"):
+    """
+    Soft body with Goal vertex group; goal spring stiffness at API maximum (~1).
+    """
+    mod = mesh_obj.modifiers.new("Softbody", 'SOFT_BODY')
+    settings = mod.settings
+    _set_softbody_goal_vertex_group(settings, goal_group_name)
+    if hasattr(settings, "goal_spring"):
+        settings.goal_spring = 0.999
+    return mod
+
+
+def _unique_obj_name(prefix):
+    name = prefix
+    n = 1
+    while name in bpy.data.objects:
+        name = f"{prefix}.{n:03d}"
+        n += 1
+    return name
+
+
+def _median_world_from_indices(mesh_obj, indices):
+    me = mesh_obj.data
+    acc = Vector()
+    for i in indices:
+        acc += mesh_obj.matrix_world @ me.vertices[i].co
+    return acc / len(indices)
+
+
+def setup_softbody_hook_presets(mesh_obj, preset, vert_indices_matrix):
+    """
+    Create empties + HOOK modifiers for chain head/tail verts (all columns + front/back shell).
+    preset: 'NONE' | 'BOTH_ENDS' | 'HEAD_ONLY' | 'TAIL_ONLY'
+    """
+    if preset == 'NONE' or not vert_indices_matrix:
+        return
+
+    total_rows = len(vert_indices_matrix[0])
+    last_row = total_rows - 1
+
+    head_indices = []
+    tail_indices = []
+    for col in range(len(vert_indices_matrix)):
+        if vert_indices_matrix[col][0]:
+            head_indices.extend(vert_indices_matrix[col][0])
+        if vert_indices_matrix[col][last_row]:
+            tail_indices.extend(vert_indices_matrix[col][last_row])
+
+    need_head = preset in ('BOTH_ENDS', 'HEAD_ONLY') and head_indices
+    need_tail = preset in ('BOTH_ENDS', 'TAIL_ONLY') and tail_indices
+
+    if need_head:
+        vg = mesh_obj.vertex_groups.get(HOOK_GROUP_HEAD) or mesh_obj.vertex_groups.new(
+            name=HOOK_GROUP_HEAD
+        )
+        for i in head_indices:
+            vg.add([i], 1.0, 'REPLACE')
+        empty = bpy.data.objects.new(_unique_obj_name("SW_Hook_Empty_Head"), None)
+        empty.empty_display_type = 'PLAIN_AXES'
+        empty.empty_display_size = mesh_obj.dimensions.length * 0.05 if mesh_obj.dimensions.length > 0 else 0.05
+        bpy.context.collection.objects.link(empty)
+        med = _median_world_from_indices(mesh_obj, head_indices)
+        empty.matrix_world = Matrix.Translation(med)
+        hook = mesh_obj.modifiers.new(_unique_obj_name("SW_Hook_Head"), 'HOOK')
+        hook.object = empty
+        hook.vertex_group = HOOK_GROUP_HEAD
+
+    if need_tail:
+        vg = mesh_obj.vertex_groups.get(HOOK_GROUP_TAIL) or mesh_obj.vertex_groups.new(
+            name=HOOK_GROUP_TAIL
+        )
+        for i in tail_indices:
+            vg.add([i], 1.0, 'REPLACE')
+        empty = bpy.data.objects.new(_unique_obj_name("SW_Hook_Empty_Tail"), None)
+        empty.empty_display_type = 'PLAIN_AXES'
+        empty.empty_display_size = mesh_obj.dimensions.length * 0.05 if mesh_obj.dimensions.length > 0 else 0.05
+        bpy.context.collection.objects.link(empty)
+        med = _median_world_from_indices(mesh_obj, tail_indices)
+        empty.matrix_world = Matrix.Translation(med)
+        hook = mesh_obj.modifiers.new(_unique_obj_name("SW_Hook_Tail"), 'HOOK')
+        hook.object = empty
+        hook.vertex_group = HOOK_GROUP_TAIL
 
 
 def add_bone_constraints(mesh_obj, bone_matrix, max_rows, max_cols):
@@ -962,12 +1268,40 @@ class SKELETALWEAVER_OT_weave(Operator):
                 mesh_name = f"{MESH_GUIDE_NAME}_{group_idx}"
             
             # Check if single column - create ribbon instead
-            if max_cols == 1:
-                mesh_obj, vert_matrix, expanded_bone_matrix, actual_cols = create_ribbon_mesh(
-                    coord_matrix, bone_matrix, max_rows, mesh_name, 
-                    props.ribbon_width, armature_obj
+            use_softbody_here = (
+                props.use_physics_modifier
+                and props.physics_mode == 'SOFT_BODY'
+                and max_cols == 1
+            )
+            vert_indices_matrix = None
+
+            if props.use_physics_modifier and props.physics_mode == 'SOFT_BODY' and max_cols > 1:
+                self.report(
+                    {'WARNING'},
+                    "Soft Body + hooks require a single bone chain; woven mesh was created without Soft Body",
                 )
-                # Use expanded bone matrix for vertex groups
+
+            if max_cols == 1:
+                if use_softbody_here:
+                    mesh_obj, vert_matrix, expanded_bone_matrix, actual_cols, vert_indices_matrix = (
+                        create_extruded_ribbon_mesh(
+                            coord_matrix,
+                            bone_matrix,
+                            max_rows,
+                            mesh_name,
+                            props.ribbon_width,
+                            armature_obj,
+                        )
+                    )
+                else:
+                    mesh_obj, vert_matrix, expanded_bone_matrix, actual_cols = create_ribbon_mesh(
+                        coord_matrix,
+                        bone_matrix,
+                        max_rows,
+                        mesh_name,
+                        props.ribbon_width,
+                        armature_obj,
+                    )
                 bone_matrix_for_groups = expanded_bone_matrix
                 max_cols_for_groups = actual_cols
             else:
@@ -976,23 +1310,32 @@ class SKELETALWEAVER_OT_weave(Operator):
                 )
                 bone_matrix_for_groups = bone_matrix
                 max_cols_for_groups = max_cols
-            
+
+            pin_group_name = "Goal" if use_softbody_here else "Pin"
+
             # Create vertex groups
             if props.create_vertex_groups:
                 custom_curve_mapping = None
-                if props.pin_falloff_pattern == 'CUSTOM':
+                if props.pin_use_falloff and props.pin_falloff_pattern == 'CUSTOM':
                     custom_curve_mapping = get_or_create_pin_falloff_brush().curve_distance_falloff
-                create_vertex_groups(mesh_obj, vert_matrix, bone_matrix_for_groups, 
-                                   max_rows, max_cols_for_groups,
-                                   props.pin_use_falloff,
-                                   props.pin_falloff_pattern,
-                                   props.pin_falloff_strength,
-                                   props.pin_min_weight,
-                                   custom_curve_mapping)
-            
+                create_vertex_groups(
+                    mesh_obj,
+                    vert_matrix,
+                    bone_matrix_for_groups,
+                    max_rows,
+                    max_cols_for_groups,
+                    props.pin_use_falloff,
+                    props.pin_falloff_pattern,
+                    props.pin_falloff_strength,
+                    props.pin_min_weight,
+                    custom_curve_mapping,
+                    pin_group_name=pin_group_name,
+                    vert_indices_matrix=vert_indices_matrix,
+                )
+
             # Parent to appropriate bone
             parent_mesh_to_armature(mesh_obj, armature_obj, mesh_group['parent_bone'])
-            
+
             # Store for later processing
             created_meshes.append({
                 'obj': mesh_obj,
@@ -1002,12 +1345,23 @@ class SKELETALWEAVER_OT_weave(Operator):
                 'max_cols': max_cols,
                 'verts': len(mesh_obj.data.vertices),
                 'faces': len(mesh_obj.data.polygons),
+                'vert_indices_matrix': vert_indices_matrix,
+                'softbody_eligible': use_softbody_here,
             })
-        
-        # Add cloth modifier if enabled
-        if props.add_cloth_modifier:
+
+        # Add simulation modifiers
+        if props.use_physics_modifier and props.physics_mode == 'CLOTH':
             for mesh_info in created_meshes:
                 add_cloth_modifier(mesh_info['obj'])
+        elif props.use_physics_modifier and props.physics_mode == 'SOFT_BODY':
+            for mesh_info in created_meshes:
+                if mesh_info.get('softbody_eligible'):
+                    add_softbody_modifier(mesh_info['obj'], goal_group_name="Goal")
+                    setup_softbody_hook_presets(
+                        mesh_info['obj'],
+                        props.softbody_hook_preset,
+                        mesh_info.get('vert_indices_matrix'),
+                    )
         
         # Add bone constraints if enabled
         total_constraints = 0
@@ -1038,8 +1392,10 @@ class SKELETALWEAVER_OT_weave(Operator):
                 msg_parts.append(f"'{m['obj'].name}' → {parent_name}")
             
             extra_info = []
-            if props.add_cloth_modifier:
+            if props.use_physics_modifier and props.physics_mode == 'CLOTH':
                 extra_info.append("Cloth")
+            elif props.use_physics_modifier and props.physics_mode == 'SOFT_BODY':
+                extra_info.append("Soft Body")
             if props.add_bone_constraints:
                 extra_info.append(f"{total_constraints} constraints")
             
@@ -1272,6 +1628,71 @@ class SKELETALWEAVER_OT_auto_merge(Operator):
         return {'FINISHED'}
 
 
+class SKELETALWEAVER_OT_add_hook_from_selection(Operator):
+    bl_idname = "mesh.skeletal_weaver_add_hook_from_selection"
+    bl_label = "Add Hook from Selection"
+    bl_description = (
+        "Selected vertices: assign Goal weight 1, new hook vertex group, Empty, and Hook modifier"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.edit_object
+        if obj is None or obj.type != 'MESH':
+            return False
+        if context.mode != 'EDIT_MESH':
+            return False
+        return obj.name.startswith(MESH_GUIDE_NAME)
+
+    def execute(self, context):
+        obj = context.edit_object
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        selected = [v for v in bm.verts if v.select]
+        if not selected:
+            self.report({'WARNING'}, "No vertices selected")
+            return {'CANCELLED'}
+        indices = [v.index for v in selected]
+
+        prev_mode = context.mode
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        vg_goal = obj.vertex_groups.get("Goal") or obj.vertex_groups.new(name="Goal")
+        for i in indices:
+            vg_goal.add([i], 1.0, 'REPLACE')
+
+        hk_base = "SW_Hook_User"
+        n = 0
+        while True:
+            gname = hk_base if n == 0 else f"{hk_base}_{n:03d}"
+            if gname not in obj.vertex_groups:
+                break
+            n += 1
+        vg_hook = obj.vertex_groups.new(name=gname)
+        for i in indices:
+            vg_hook.add([i], 1.0, 'REPLACE')
+
+        med = _median_world_from_indices(obj, indices)
+        empty = bpy.data.objects.new(_unique_obj_name("SW_Hook_Empty"), None)
+        empty.empty_display_type = 'PLAIN_AXES'
+        empty.empty_display_size = 0.05
+        context.collection.objects.link(empty)
+        empty.matrix_world = Matrix.Translation(med)
+
+        mod = obj.modifiers.new(_unique_obj_name("SW_Hook"), 'HOOK')
+        mod.object = empty
+        mod.vertex_group = gname
+
+        context.view_layer.objects.active = obj
+        if prev_mode == 'EDIT_MESH':
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        self.report({'INFO'}, "Added Goal weights, Empty, and Hook for %d vertices" % len(indices))
+        return {'FINISHED'}
+
+
 # =============================================================================
 # UI PANEL
 # =============================================================================
@@ -1333,19 +1754,26 @@ class SKELETALWEAVER_PT_main(Panel):
         box = layout.box()
         box.label(text="Simulation & Rigging", icon='MOD_CLOTH')
         col = box.column(align=True)
-        col.prop(props, "add_cloth_modifier")
+        col.prop(props, "use_physics_modifier", text="Add Physics Modifier")
+        if props.use_physics_modifier:
+            col.prop(props, "physics_mode", text="Type")
+            if props.physics_mode == 'SOFT_BODY':
+                col.prop(props, "softbody_hook_preset")
         col.prop(props, "add_bone_constraints")
         col.separator()
-        col.label(text="Pin", icon='FCURVE')
+        col.label(text="Pin / Goal weights", icon='FCURVE')
         col.prop(props, "pin_use_falloff", text="Pin Falloff (else top-only free swing)")
         if props.pin_use_falloff:
             col.prop(props, "pin_falloff_pattern", text="Pattern")
-        if props.pin_use_falloff and props.pin_falloff_pattern == 'CUSTOM':
+        show_falloff_params = (
+            props.pin_use_falloff and props.pin_falloff_pattern != 'TOP_ONLY'
+        )
+        if show_falloff_params and props.pin_falloff_pattern == 'CUSTOM':
             brush = get_or_create_pin_falloff_brush()
             col.template_curve_mapping(brush, "curve_distance_falloff")
-        elif props.pin_use_falloff:
+        elif show_falloff_params:
             col.prop(props, "pin_falloff_strength")
-        if props.pin_use_falloff:
+        if show_falloff_params:
             col.prop(props, "pin_min_weight")
         
         layout.separator()
@@ -1368,6 +1796,31 @@ class SKELETALWEAVER_PT_main(Panel):
                      icon='BRUSH_DATA')
         col.operator("armature.cleanup_weaver_meshes", text="Delete All Guide Meshes", 
                      icon='TRASH')
+
+
+class SKELETALWEAVER_PT_edit_hooks(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Skeletal Weaver"
+    bl_label = "Guide Mesh Hooks"
+    bl_context = "mesh_edit"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.edit_object
+        return (
+            obj is not None
+            and obj.type == 'MESH'
+            and obj.name.startswith(MESH_GUIDE_NAME)
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator(
+            "mesh.skeletal_weaver_add_hook_from_selection",
+            text="Add Hook from Selection",
+            icon='HOOK',
+        )
 
 
 # =============================================================================
@@ -1393,25 +1846,50 @@ class SkeletalWeaverProperties(PropertyGroup):
     
     create_vertex_groups: BoolProperty(
         name="Create Vertex Groups",
-        description="Create vertex groups for Pin and individual bones",
+        description="Create mass vertex group (Pin or Goal) and per-bone groups",
         default=True,
     )
     
     ribbon_width: FloatProperty(
         name="Ribbon Width",
-        description="Width of ribbon mesh when only one chain is selected",
+        description="Width of ribbon mesh when only one chain is selected; also Soft Body extrusion thickness",
         default=0.02,
         min=0.001,
         max=1.0,
         unit='LENGTH',
     )
-    
-    add_cloth_modifier: BoolProperty(
-        name="Add Cloth Modifier",
-        description="Add cloth simulation modifier with Pin group",
+
+    use_physics_modifier: BoolProperty(
+        name="Add Physics Modifier",
+        description="After weave, add Cloth or Soft Body (turn off for guide mesh only)",
         default=True,
     )
-    
+
+    physics_mode: EnumProperty(
+        name="Physics Type",
+        description="Cloth (flat/woven ribbon) or Soft Body (extruded ribbon, single chain)",
+        items=[
+            ('CLOTH', "Cloth", "Cloth simulation using Pin vertex group"),
+            (
+                'SOFT_BODY',
+                "Soft Body",
+                "Extruded ribbon + Goal + Soft Body (single chain only); optional hook presets",
+            ),
+        ],
+        default='CLOTH',
+    )
+
+    softbody_hook_preset: EnumProperty(
+        name="Soft Body Hooks",
+        description="Preset hook empties on chain ends (Soft Body mode only)",
+        items=[
+            ('NONE', "None", "No automatic hook modifiers"),
+            ('BOTH_ENDS', "Both Ends", "Hook modifiers on head and tail vertices"),
+            ('HEAD_ONLY', "Head Only", "Hook modifier on chain head (parent row) only"),
+            ('TAIL_ONLY', "Tail Only", "Hook modifier on chain tail only"),
+        ],
+        default='BOTH_ENDS',
+    )
     add_bone_constraints: BoolProperty(
         name="Add Bone Constraints",
         description="Add DAMPED_TRACK constraints to bones targeting mesh vertices",
@@ -1426,8 +1904,13 @@ class SkeletalWeaverProperties(PropertyGroup):
 
     pin_falloff_pattern: EnumProperty(
         name="Pin Falloff Pattern",
-        description="How pin weight decreases from top (x=0) to bottom (x=1)",
+        description="How pin/goal weight decreases from top (x=0) to bottom (x=1), when Pin Falloff is enabled",
         items=[
+            (
+                'TOP_ONLY',
+                "Top Only",
+                "Only the root row has full weight; all other rows 0 (same numeric result as turning Pin Falloff off)",
+            ),
             ('INVERSE', "Inverse", "Fast drop near top, slower near bottom (recommended)"),
             ('EXPONENTIAL', "Exponential", "Strong early damping with smooth tail"),
             ('ROOT', "Root", "Very fast initial drop, then long soft tail"),
@@ -1469,7 +1952,9 @@ classes = (
     SKELETALWEAVER_OT_clear_invalid_constraints,
     SKELETALWEAVER_OT_cleanup_meshes,
     SKELETALWEAVER_OT_auto_merge,
+    SKELETALWEAVER_OT_add_hook_from_selection,
     SKELETALWEAVER_PT_main,
+    SKELETALWEAVER_PT_edit_hooks,
 )
 
 
