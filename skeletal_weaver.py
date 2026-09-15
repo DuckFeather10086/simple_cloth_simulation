@@ -7,12 +7,14 @@ from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector, Matrix
 from math import exp
 from collections import defaultdict
+from uuid import uuid4
+from mathutils.kdtree import KDTree
 
 bl_info = {
     "name": "Skeletal Weaver",
     "author": "Duck Feather",
-    "version": (2, 3, 0),
-    "blender": (2, 80, 0),
+    "version": (2, 4, 0),
+    "blender": (5, 0, 0),
     "location": "Pose Mode > Sidebar > Skeletal Weaver",
     "description": "Generates helper meshes (grid/web) based on selected bones in an Armature",
     "warning": "",
@@ -26,6 +28,11 @@ WEAVER_CONSTRAINT_PREFIX = "SW_DampedTrack"
 PIN_FALLOFF_BRUSH_NAME = "SkeletalWeaver_PinFalloff"
 HOOK_GROUP_HEAD = "SW_Hook_Head"
 HOOK_GROUP_TAIL = "SW_Hook_Tail"
+OWNER_KEY = "skeletal_weaver_owner"
+ROLE_KEY = "skeletal_weaver_role"
+SOURCE_KEY = "skeletal_weaver_source"
+BONES_KEY = "skeletal_weaver_bones"
+TARGETS_KEY = "skeletal_weaver_targets"
 
 
 # =============================================================================
@@ -49,75 +56,38 @@ def snap_close_bones(selected_bones, snap_threshold=0.001):
 
 
 def remove_damped_track_constraints(pose_bones):
-    """
-    Remove all DAMPED_TRACK constraints from the given pose bones.
-    Returns the count of removed constraints.
-    """
-    removed_count = 0
-    
+    """Remove only explicitly identified plugin tracks, including broken targets."""
+    count = 0
     for bone in pose_bones:
-        # Collect constraints to remove (can't modify while iterating)
-        constraints_to_remove = [c for c in bone.constraints if c.type == 'DAMPED_TRACK']
-        
-        for constraint in constraints_to_remove:
+        owned = [c for c in bone.constraints if is_weaver_damped_track_constraint(bone, c)]
+        for constraint in owned:
             bone.constraints.remove(constraint)
-            removed_count += 1
-
-        # If this bone had Skeletal Weaver constraints, restore stored pre-constraint pose.
-        if constraints_to_remove:
+            count += 1
+        if owned:
             restore_pre_constraint_pose(bone)
-    
-    return removed_count
+    return count
 
 
 def remove_invalid_constraints(pose_bones):
-    """
-    Remove constraints with invalid/missing targets from the given pose bones.
-    A constraint is considered invalid if:
-    - It has no target object, OR
-    - It has a target but the subtarget (vertex group/bone) doesn't exist
-    
-    Returns the count of removed constraints.
-    """
-    removed_count = 0
-    
+    """Remove broken plugin tracks; targetless user constraints may be intentional."""
+    count = 0
     for bone in pose_bones:
-        constraints_to_remove = []
-        
-        for constraint in bone.constraints:
-            is_invalid = False
-            
-            # Check if constraint has a target attribute
-            if hasattr(constraint, 'target'):
-                target = constraint.target
-                
-                if target is None:
-                    # No target object set
-                    is_invalid = True
-                elif hasattr(constraint, 'subtarget') and constraint.subtarget:
-                    # Has subtarget specified - check if it exists
-                    subtarget = constraint.subtarget
-                    
-                    if target.type == 'MESH':
-                        # For mesh targets, check vertex groups
-                        if subtarget not in target.vertex_groups:
-                            is_invalid = True
-                    elif target.type == 'ARMATURE':
-                        # For armature targets, check bones
-                        if subtarget not in target.pose.bones:
-                            is_invalid = True
-            
-            if is_invalid:
-                constraints_to_remove.append(constraint)
-        
-        for constraint in constraints_to_remove:
-            bone.constraints.remove(constraint)
-            removed_count += 1
-
-        if constraints_to_remove:
+        broken = []
+        for c in bone.constraints:
+            if not is_weaver_damped_track_constraint(bone, c):
+                continue
+            target = c.target
+            if target is None or (c.subtarget and (
+                (target.type == 'MESH' and c.subtarget not in target.vertex_groups) or
+                (target.type == 'ARMATURE' and c.subtarget not in target.pose.bones)
+            )):
+                broken.append(c)
+        for c in broken:
+            bone.constraints.remove(c)
+            count += 1
+        if broken and not any(is_weaver_damped_track_constraint(bone, c) for c in bone.constraints):
             restore_pre_constraint_pose(bone)
-    
-    return removed_count
+    return count
 
 
 def select_bone_chain(armature_obj, start_bones):
@@ -160,90 +130,41 @@ def select_bone_chain(armature_obj, start_bones):
 # =============================================================================
 
 def identify_mesh_groups(selected_bones, armature_obj):
+    """Weave sibling chains sharing an anchor; split at gaps and forks.
+
+    A connected linear child continues its parent's column. At a fork all
+    selected children start a new sheet anchored to that junction bone.
+    Unselected ancestors stay anchors, never implicit simulation input.
     """
-    Identify separate mesh groups from selected bones.
-    
-    - "Primary group": bones whose parent is NOT in selection (or is None)
-      These bones and their connected descendants form the first mesh.
-    - "Secondary groups": bones whose parent IS in selection but use_connect = False
-      These are grouped by their parent bone, each group forms a separate mesh.
-    
-    Returns:
-        List of mesh group dicts, each containing:
-        - 'chain_roots': list of bones that start chains in this group
-        - 'parent_bone': the bone to parent the mesh to
-        - 'all_bones': set of all bones in this group
-    """
-    selected_names = {b.name for b in selected_bones}
-    
-    primary_roots = []
-    secondary_roots = defaultdict(list)
-    
+    names = {b.name for b in selected_bones}
+    roots_by_parent = defaultdict(list)
     for bone in selected_bones:
-        if bone.parent is None or bone.parent.name not in selected_names:
-            primary_roots.append(bone)
-        elif not bone.bone.use_connect:
-            secondary_roots[bone.parent.name].append(bone)
-    
-    mesh_groups = []
-    
-    if primary_roots:
-        primary_group = {
-            'chain_roots': primary_roots,
-            'parent_bone': None,
-            'all_bones': set(),
-        }
-        
-        for root in primary_roots:
-            chain = trace_chain_bones(root, selected_bones)
-            primary_group['all_bones'].update(chain)
-        
-        topmost_root = max(primary_roots, key=lambda b: b.bone.head_local.z)
-        primary_group['parent_bone'] = topmost_root.parent
-        
-        mesh_groups.append(primary_group)
-    
-    for parent_name, roots in secondary_roots.items():
-        parent_bone = armature_obj.pose.bones.get(parent_name)
-        
-        secondary_group = {
-            'chain_roots': roots,
-            'parent_bone': parent_bone,
-            'all_bones': set(),
-        }
-        
+        parent = bone.parent
+        siblings = connected_children(parent, names) if parent else []
+        if (parent is None or parent.name not in names or
+                not bone.bone.use_connect or len(siblings) != 1):
+            roots_by_parent[parent.name if parent else None].append(bone)
+    groups = []
+    for parent_name, roots in roots_by_parent.items():
+        bones = set()
         for root in roots:
-            chain = trace_chain_bones(root, selected_bones)
-            secondary_group['all_bones'].update(chain)
-        
-        mesh_groups.append(secondary_group)
-    
-    return mesh_groups
+            bones.update(trace_chain(root, selected_bones))
+        groups.append({'chain_roots': roots,
+                       'parent_bone': armature_obj.pose.bones.get(parent_name) if parent_name else None,
+                       'all_bones': bones})
+    covered = [b.name for group in groups for b in group['all_bones']]
+    if len(covered) != len(names) or set(covered) != names:
+        raise ValueError("Bone grouping did not cover each selected bone exactly once")
+    return groups
+
+
+def connected_children(bone, selected_names):
+    return [child for child in bone.children
+            if child.name in selected_names and child.bone.use_connect]
 
 
 def trace_chain_bones(start_bone, selected_bones):
-    """
-    Trace a chain from start_bone, following only CONNECTED children.
-    Returns set of all bones in the chain.
-    """
-    selected_names = {b.name for b in selected_bones}
-    chain = {start_bone}
-    current = start_bone
-    
-    while True:
-        next_bone = None
-        for child in current.children:
-            if child.name in selected_names and child.bone.use_connect:
-                next_bone = child
-                break
-        
-        if next_bone is None:
-            break
-        
-        chain.add(next_bone)
-        current = next_bone
-    
-    return chain
+    return set(trace_chain(start_bone, selected_bones))
 
 
 # =============================================================================
@@ -251,28 +172,13 @@ def trace_chain_bones(start_bone, selected_bones):
 # =============================================================================
 
 def trace_chain(start_bone, selected_bones):
-    """
-    Trace a chain from start_bone downward through selected CONNECTED children.
-    Returns a list of bones in order from start to end.
-    """
-    selected_names = {b.name for b in selected_bones}
+    names = {bone.name for bone in selected_bones}
     chain = [start_bone]
-    current = start_bone
-    
     while True:
-        next_bone = None
-        for child in current.children:
-            if child.name in selected_names and child.bone.use_connect:
-                next_bone = child
-                break
-        
-        if next_bone is None:
-            break
-        
-        chain.append(next_bone)
-        current = next_bone
-    
-    return chain
+        children = connected_children(chain[-1], names)
+        if len(children) != 1:
+            return chain
+        chain.append(children[0])
 
 
 def sort_chain_starts_by_x(chain_starts, armature_obj):
@@ -364,6 +270,34 @@ def extract_coordinate_matrix(bone_matrix, armature_obj, max_rows, max_cols):
 # MESH GENERATION
 # =============================================================================
 
+def ribbon_frames(coords, bone_matrix, armature_obj):
+    valid = [co for co in coords if co is not None]
+    first = bone_matrix[0][0]
+    axis = (armature_obj.matrix_world @ first.matrix).to_3x3() @ Vector((1, 0, 0))
+    frames = []
+    previous_tangent = None
+    for row in range(len(valid)):
+        before = valid[max(0, row - 1)]
+        after = valid[min(len(valid) - 1, row + 1)]
+        tangent = after - before
+        if tangent.length < 1e-8:
+            tangent = valid[row] - before if row else after - valid[row]
+        if tangent.length < 1e-8:
+            raise ValueError("Zero-length or folded-back bone segment")
+        tangent.normalize()
+        if previous_tangent is not None:
+            axis = previous_tangent.rotation_difference(tangent) @ axis
+        axis -= tangent * axis.dot(tangent)
+        if axis.length < 1e-8:
+            reference = min((Vector((1, 0, 0)), Vector((0, 1, 0)), Vector((0, 0, 1))),
+                            key=lambda v: abs(v.dot(tangent)))
+            axis = reference - tangent * reference.dot(tangent)
+        axis.normalize()
+        frames.append((axis.copy(), axis.cross(tangent).normalized()))
+        previous_tangent = tangent
+    return frames
+
+
 def create_ribbon_mesh(coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_width, armature_obj):
     """
     Create a ribbon (thin rectangular strip) mesh for single-column chains.
@@ -381,18 +315,8 @@ def create_ribbon_mesh(coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_wi
     # Get the single column coordinates
     coords = coord_matrix[0]
     
-    # Calculate perpendicular offset direction for ribbon
-    # Use the first bone's local X axis as the offset direction
-    first_bone = bone_matrix[0][0]
-    if first_bone is not None:
-        # Get bone's world matrix to find its local X axis
-        bone_world_matrix = armature_obj.matrix_world @ first_bone.bone.matrix_local
-        # Local X axis in world space
-        offset_dir = Vector((bone_world_matrix[0][0], bone_world_matrix[0][1], bone_world_matrix[0][2])).normalized()
-    else:
-        # Fallback: use world X axis
-        offset_dir = Vector((1, 0, 0))
-    
+    frames = ribbon_frames(coords, bone_matrix, armature_obj)
+
     half_width = ribbon_width / 2.0
     
     # Create vertices with offset
@@ -400,12 +324,12 @@ def create_ribbon_mesh(coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_wi
         coord = coords[row]
         if coord is not None:
             # Left vertex (negative offset)
-            left_pos = coord - offset_dir * half_width
+            left_pos = coord - frames[row][0] * half_width
             vert_left = bm.verts.new(left_pos)
             vert_matrix[0][row] = vert_left
             
             # Right vertex (positive offset)
-            right_pos = coord + offset_dir * half_width
+            right_pos = coord + frames[row][0] * half_width
             vert_right = bm.verts.new(right_pos)
             vert_matrix[1][row] = vert_right
     
@@ -446,7 +370,6 @@ def create_ribbon_mesh(coord_matrix, bone_matrix, max_rows, mesh_name, ribbon_wi
                 pass
     
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-    bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=0.0001)
     
     # Extract coordinates before freeing
     coord_vert_matrix = [[None for _ in range(total_rows)] for _ in range(2)]
@@ -486,47 +409,24 @@ def create_extruded_ribbon_mesh(
     front = [[None for _ in range(total_rows)] for _ in range(2)]
     coords = coord_matrix[0]
 
-    first_bone = bone_matrix[0][0]
-    if first_bone is not None:
-        bone_world_matrix = armature_obj.matrix_world @ first_bone.bone.matrix_local
-        offset_dir = Vector(
-            (bone_world_matrix[0][0], bone_world_matrix[0][1], bone_world_matrix[0][2])
-        ).normalized()
-    else:
-        offset_dir = Vector((1, 0, 0))
+    frames = ribbon_frames(coords, bone_matrix, armature_obj)
 
     half_width = ribbon_width / 2.0
 
     for row in range(total_rows):
         coord = coords[row]
         if coord is not None:
-            front[0][row] = bm.verts.new(coord - offset_dir * half_width)
-            front[1][row] = bm.verts.new(coord + offset_dir * half_width)
+            front[0][row] = bm.verts.new(coord - frames[row][0] * half_width - frames[row][1] * half_width)
+            front[1][row] = bm.verts.new(coord + frames[row][0] * half_width - frames[row][1] * half_width)
 
     bm.verts.ensure_lookup_table()
-
-    extrude_vec = Vector((0.0, 0.0, 1.0))
-    for row in range(1, total_rows):
-        if coords[0] is not None and coords[row] is not None:
-            seg = coords[row] - coords[0]
-            if seg.length > 1e-8:
-                extrude_vec = seg.normalized().cross(offset_dir).normalized()
-                break
-
-    if total_rows >= 2 and front[0][0] and front[1][0] and front[0][1]:
-        v_tl = front[0][0].co
-        v_tr = front[1][0].co
-        v_bl = front[0][1].co
-        n = (v_tr - v_tl).cross(v_bl - v_tl)
-        if n.length > 1e-10:
-            extrude_vec = n.normalized()
 
     back = [[None for _ in range(total_rows)] for _ in range(2)]
     for row in range(total_rows):
         for col in range(2):
             if front[col][row] is not None:
                 back[col][row] = bm.verts.new(
-                    front[col][row].co + extrude_vec * ribbon_width
+                    front[col][row].co + frames[row][1] * ribbon_width
                 )
 
     bm.verts.ensure_lookup_table()
@@ -780,7 +680,6 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
                 pass
     
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-    bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=0.0001)
     
     coord_vert_matrix = [[None for _ in range(total_rows)] for _ in range(max_cols)]
     for col in range(max_cols):
@@ -788,6 +687,8 @@ def create_woven_mesh(coord_matrix, bone_matrix, max_rows, max_cols, mesh_name):
             if vert_matrix[col][row] is not None:
                 coord_vert_matrix[col][row] = vert_matrix[col][row].co.copy()
     
+    bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=0.0001)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
@@ -866,7 +767,7 @@ def create_vertex_groups(
     pin_group = mesh_obj.vertex_groups.new(name=pin_group_name)
     mesh = mesh_obj.data
     pin_weights_by_vert = {}
-    bone_assignment_by_vert = {}
+    bone_assignment_by_vert = defaultdict(set)
 
     use_custom_curve = (
         pin_use_falloff
@@ -876,27 +777,25 @@ def create_vertex_groups(
     if use_custom_curve:
         pin_custom_curve_mapping.initialize()
 
-    coord_to_idx = {}
+    tree = None
     if vert_indices_matrix is None:
-        for idx, vert in enumerate(mesh.vertices):
-            coord_key = (round(vert.co.x, 5), round(vert.co.y, 5), round(vert.co.z, 5))
-            coord_to_idx[coord_key] = idx
+        tree = KDTree(len(mesh.vertices))
+        for vert in mesh.vertices:
+            tree.insert(vert.co, vert.index)
+        tree.balance()
 
-    def pin_weight_for_row(row):
-        if not pin_use_falloff:
+    def pin_weight_for_row(row, distances):
+        if not pin_use_falloff or pin_falloff_pattern == 'TOP_ONLY':
             return 1.0 if row == 0 else 0.0
-        if pin_falloff_pattern == 'TOP_ONLY':
-            return 1.0 if row == 0 else 0.0
-        normalized_distance = row / (total_rows - 1) if total_rows > 1 else 0.0
-        return evaluate_pin_falloff(
-            normalized_distance,
-            pin_falloff_pattern,
-            pin_falloff_strength,
-            pin_min_weight,
-            pin_custom_curve_mapping,
-        )
+        normalized_distance = distances[row] / distances[-1] if distances[-1] else 0.0
+        return evaluate_pin_falloff(normalized_distance, pin_falloff_pattern,
+                                    pin_falloff_strength, pin_min_weight, pin_custom_curve_mapping)
 
     for col in range(max_cols):
+        valid_coords = [co for co in coord_vert_matrix[col] if co is not None]
+        distances = [0.0]
+        for a, b in zip(valid_coords, valid_coords[1:]):
+            distances.append(distances[-1] + (b - a).length)
         for row in range(total_rows):
             if vert_indices_matrix is not None:
                 idxs = vert_indices_matrix[col][row]
@@ -906,12 +805,12 @@ def create_vertex_groups(
                 orig_coord = coord_vert_matrix[col][row]
                 if orig_coord is None:
                     continue
-                coord_key = (round(orig_coord.x, 5), round(orig_coord.y, 5), round(orig_coord.z, 5))
-                if coord_key not in coord_to_idx:
-                    continue
-                idxs = [coord_to_idx[coord_key]]
+                _, index, distance = tree.find(orig_coord)
+                if distance > 0.00011:
+                    raise ValueError("Cannot map a guide vertex after welding")
+                idxs = [index]
 
-            pin_weight = pin_weight_for_row(row)
+            pin_weight = pin_weight_for_row(row, distances)
             for vert_idx in idxs:
                 pin_weights_by_vert[vert_idx] = max(
                     pin_weights_by_vert.get(vert_idx, 0.0), pin_weight
@@ -929,18 +828,18 @@ def create_vertex_groups(
                                 if bone is not None:
                                     break
                     if bone is not None:
-                        if vert_idx not in bone_assignment_by_vert:
-                            bone_assignment_by_vert[vert_idx] = bone.name
+                        bone_assignment_by_vert[vert_idx].add(bone.name)
 
     for vert_idx, weight in pin_weights_by_vert.items():
         pin_group.add([vert_idx], weight, 'REPLACE')
 
-    for vert_idx, group_name in bone_assignment_by_vert.items():
-        if group_name not in mesh_obj.vertex_groups:
-            bone_group = mesh_obj.vertex_groups.new(name=group_name)
-        else:
-            bone_group = mesh_obj.vertex_groups[group_name]
-        bone_group.add([vert_idx], 1.0, 'REPLACE')
+    target_groups = {}
+    for vert_idx, group_names in bone_assignment_by_vert.items():
+        for bone_name in sorted(group_names):
+            if bone_name not in target_groups:
+                target_groups[bone_name] = mesh_obj.vertex_groups.new(name=bone_name)
+            target_groups[bone_name].add([vert_idx], 1.0, 'REPLACE')
+    mesh_obj[TARGETS_KEY] = {name: group.name for name, group in target_groups.items()}
 
 
 def add_cloth_modifier(mesh_obj):
@@ -949,6 +848,7 @@ def add_cloth_modifier(mesh_obj):
     """
     cloth_mod = mesh_obj.modifiers.new("Cloth", 'CLOTH')
     cloth_mod.settings.vertex_group_mass = "Pin"
+    set_cache_range(cloth_mod)
     return cloth_mod
 
 
@@ -968,7 +868,16 @@ def add_softbody_modifier(mesh_obj, goal_group_name="Goal"):
     _set_softbody_goal_vertex_group(settings, goal_group_name)
     if hasattr(settings, "goal_spring"):
         settings.goal_spring = 0.999
+    settings.use_goal = True
+    settings.goal_min = 0.0
+    settings.goal_max = 1.0
+    set_cache_range(mod)
     return mod
+
+
+def set_cache_range(mod):
+    mod.point_cache.frame_start = bpy.context.scene.frame_start
+    mod.point_cache.frame_end = bpy.context.scene.frame_end
 
 
 def _unique_obj_name(prefix):
@@ -989,58 +898,43 @@ def _median_world_from_indices(mesh_obj, indices):
 
 
 def setup_softbody_hook_presets(mesh_obj, preset, vert_indices_matrix):
-    """
-    Create empties + HOOK modifiers for chain head/tail verts (all columns + front/back shell).
-    preset: 'NONE' | 'BOTH_ENDS' | 'HEAD_ONLY' | 'TAIL_ONLY'
-    """
     if preset == 'NONE' or not vert_indices_matrix:
         return
+    if preset in ('BOTH_ENDS', 'HEAD_ONLY'):
+        indices = [i for column in vert_indices_matrix for i in column[0]]
+        create_hook(mesh_obj, indices, HOOK_GROUP_HEAD)
+    if preset in ('BOTH_ENDS', 'TAIL_ONLY'):
+        indices = [i for column in vert_indices_matrix for i in column[-1]]
+        create_hook(mesh_obj, indices, HOOK_GROUP_TAIL)
 
-    total_rows = len(vert_indices_matrix[0])
-    last_row = total_rows - 1
 
-    head_indices = []
-    tail_indices = []
-    for col in range(len(vert_indices_matrix)):
-        if vert_indices_matrix[col][0]:
-            head_indices.extend(vert_indices_matrix[col][0])
-        if vert_indices_matrix[col][last_row]:
-            tail_indices.extend(vert_indices_matrix[col][last_row])
-
-    need_head = preset in ('BOTH_ENDS', 'HEAD_ONLY') and head_indices
-    need_tail = preset in ('BOTH_ENDS', 'TAIL_ONLY') and tail_indices
-
-    if need_head:
-        vg = mesh_obj.vertex_groups.get(HOOK_GROUP_HEAD) or mesh_obj.vertex_groups.new(
-            name=HOOK_GROUP_HEAD
-        )
-        for i in head_indices:
-            vg.add([i], 1.0, 'REPLACE')
-        empty = bpy.data.objects.new(_unique_obj_name("SW_Hook_Empty_Head"), None)
-        empty.empty_display_type = 'PLAIN_AXES'
-        empty.empty_display_size = mesh_obj.dimensions.length * 0.05 if mesh_obj.dimensions.length > 0 else 0.05
-        bpy.context.collection.objects.link(empty)
-        med = _median_world_from_indices(mesh_obj, head_indices)
-        empty.matrix_world = Matrix.Translation(med)
-        hook = mesh_obj.modifiers.new(_unique_obj_name("SW_Hook_Head"), 'HOOK')
-        hook.object = empty
-        hook.vertex_group = HOOK_GROUP_HEAD
-
-    if need_tail:
-        vg = mesh_obj.vertex_groups.get(HOOK_GROUP_TAIL) or mesh_obj.vertex_groups.new(
-            name=HOOK_GROUP_TAIL
-        )
-        for i in tail_indices:
-            vg.add([i], 1.0, 'REPLACE')
-        empty = bpy.data.objects.new(_unique_obj_name("SW_Hook_Empty_Tail"), None)
-        empty.empty_display_type = 'PLAIN_AXES'
-        empty.empty_display_size = mesh_obj.dimensions.length * 0.05 if mesh_obj.dimensions.length > 0 else 0.05
-        bpy.context.collection.objects.link(empty)
-        med = _median_world_from_indices(mesh_obj, tail_indices)
-        empty.matrix_world = Matrix.Translation(med)
-        hook = mesh_obj.modifiers.new(_unique_obj_name("SW_Hook_Tail"), 'HOOK')
-        hook.object = empty
-        hook.vertex_group = HOOK_GROUP_TAIL
+def create_hook(mesh_obj, indices, group_name):
+    """Bind a control before physics and make it follow the same upstream anchor."""
+    indices = sorted(set(indices))
+    if not indices:
+        raise ValueError("No vertices selected")
+    physics = next((m for m in mesh_obj.modifiers if m.type in {'CLOTH', 'SOFT_BODY'}), None)
+    pin_name = ('Goal' if physics.type == 'SOFT_BODY' else 'Pin') if physics else 'Goal'
+    goal = mesh_obj.vertex_groups.get(pin_name) or mesh_obj.vertex_groups.new(name=pin_name)
+    goal.add(indices, 1.0, 'REPLACE')
+    vg = mesh_obj.vertex_groups.new(name=group_name)
+    vg.add(indices, 1.0, 'REPLACE')
+    bpy.context.view_layer.update()
+    empty = bpy.data.objects.new(_unique_obj_name('SW_Hook_Empty'), None)
+    bpy.context.collection.objects.link(empty)
+    empty.empty_display_type = 'PLAIN_AXES'
+    empty.empty_display_size = max(mesh_obj.dimensions.length * 0.05, 0.01)
+    empty[OWNER_KEY] = mesh_obj.get(OWNER_KEY, '')
+    empty[ROLE_KEY] = 'HOOK'
+    set_parent_keep_world(empty, mesh_obj.parent, mesh_obj.parent_type, mesh_obj.parent_bone,
+                          Matrix.Translation(_median_world_from_indices(mesh_obj, indices)))
+    hook = mesh_obj.modifiers.new(group_name, 'HOOK')
+    hook.object = empty
+    hook.vertex_group = vg.name
+    hook.matrix_inverse = empty.matrix_world.inverted() @ mesh_obj.matrix_world
+    if physics:
+        mesh_obj.modifiers.move(len(mesh_obj.modifiers) - 1, list(mesh_obj.modifiers).index(physics))
+    return empty, hook
 
 
 def add_bone_constraints(mesh_obj, bone_matrix, max_rows, max_cols):
@@ -1057,37 +951,44 @@ def add_bone_constraints(mesh_obj, bone_matrix, max_rows, max_cols):
                 processed_bones.add(bone.name)
                 
                 # Check if vertex group exists for this bone
-                if bone.name in mesh_obj.vertex_groups:
+                group_name = mesh_obj.get(TARGETS_KEY, {}).get(bone.name, bone.name)
+                if group_name in mesh_obj.vertex_groups:
                     store_pre_constraint_pose(bone)
 
                     # Add DAMPED_TRACK constraint
                     constraint = bone.constraints.new('DAMPED_TRACK')
                     constraint.target = mesh_obj
-                    constraint.subtarget = bone.name
+                    constraint.subtarget = group_name
                     constraint.track_axis = 'TRACK_Y'
-                    constraint.name = f"{WEAVER_CONSTRAINT_PREFIX}_{bone.name}"
+                    constraint.name = f"{WEAVER_CONSTRAINT_PREFIX}_{uuid4().hex[:16]}"
                     
                     added_constraints.append((bone.name, constraint.name))
     
     return added_constraints
 
 
+def set_parent_keep_world(obj, parent, parent_type='OBJECT', parent_bone='', world=None):
+    world = obj.matrix_world.copy() if world is None else world.copy()
+    obj.parent = parent
+    obj.parent_type = parent_type
+    obj.parent_bone = parent_bone
+    if parent is None:
+        obj.matrix_world = world
+        bpy.context.view_layer.update()
+        return
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.matrix_basis = Matrix.Identity(4)
+    bpy.context.view_layer.update()
+    # Sample Blender's actual posed bone-parent transform (tail offset included).
+    # Store the full inverse, avoiding lossy TRS decomposition under nonuniform scale.
+    parent_world = obj.matrix_world.copy()
+    obj.matrix_parent_inverse = parent_world.inverted() @ world
+    bpy.context.view_layer.update()
+
+
 def parent_mesh_to_armature(mesh_obj, armature_obj, parent_bone):
-    """
-    Parent the mesh to the armature with bone parenting.
-    """
-    original_matrix = mesh_obj.matrix_world.copy()
-    mesh_obj.parent = armature_obj
-    
-    if parent_bone is not None:
-        mesh_obj.parent_type = 'BONE'
-        mesh_obj.parent_bone = parent_bone.name
-        bone_matrix = armature_obj.matrix_world @ parent_bone.bone.matrix_local
-        mesh_obj.matrix_parent_inverse = bone_matrix.inverted()
-    else:
-        mesh_obj.matrix_parent_inverse = armature_obj.matrix_world.inverted()
-    
-    mesh_obj.matrix_world = original_matrix
+    set_parent_keep_world(mesh_obj, armature_obj, 'BONE' if parent_bone else 'OBJECT',
+                          parent_bone.name if parent_bone else '')
 
 
 def _flatten_matrix4x4(matrix):
@@ -1129,67 +1030,151 @@ def restore_pre_constraint_pose(pose_bone):
     return True
 
 
-def is_weaver_damped_track_constraint(pose_bone, constraint, guide_object_names):
+def is_weaver_damped_track_constraint(pose_bone, constraint, guide_object_names=None):
+    """Reserved names are the ownership marker (Constraint has no ID properties).
+
+    Old SW_DampedTrack_<bone> constraints use the same namespace. Do not infer
+    ownership just from target/subtarget: users may track our guides themselves.
     """
-    Identify DAMPED_TRACK constraints created by Skeletal Weaver.
-    """
-    if constraint.type != 'DAMPED_TRACK':
-        return False
+    return constraint.type == 'DAMPED_TRACK' and constraint.name.startswith(WEAVER_CONSTRAINT_PREFIX + '_')
 
-    if constraint.name.startswith(WEAVER_CONSTRAINT_PREFIX):
-        return True
 
-    target = getattr(constraint, 'target', None)
-    subtarget = getattr(constraint, 'subtarget', "")
+def delete_guide_objects(objects):
+    owners = {obj.get(OWNER_KEY) for obj in objects if obj.get(OWNER_KEY)}
+    hooks = {m.object for obj in objects for m in obj.modifiers
+             if m.type == 'HOOK' and m.object and
+             (m.object.get(ROLE_KEY) == 'HOOK' or m.object.name.startswith('SW_Hook_Empty'))}
+    for obj in list(bpy.data.objects):
+        if obj.get(ROLE_KEY) == 'HOOK' and obj.get(OWNER_KEY) in owners:
+            hooks.add(obj)
+    for obj in objects:
+        data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if isinstance(data, bpy.types.Mesh) and data.users == 0:
+            bpy.data.meshes.remove(data)
+    for hook in hooks:
+        # A user may have deliberately shared the controller with another guide.
+        if not any(m.type == 'HOOK' and m.object == hook
+                   for obj in bpy.data.objects for m in obj.modifiers):
+            bpy.data.objects.remove(hook, do_unlink=True)
 
-    if target is not None:
-        return target.name in guide_object_names and subtarget == pose_bone.name
 
-    # Fallback for broken references: if we have stored pre-constraint pose, this likely belongs to us.
-    return subtarget == pose_bone.name and WEAVER_PRE_CONSTRAINT_MATRIX in pose_bone
+def is_guide_object(obj):
+    return obj.type == 'MESH' and (obj.get(ROLE_KEY) == 'GUIDE' or
+        (obj.name.startswith(MESH_GUIDE_NAME) and ('Pin' in obj.vertex_groups or 'Goal' in obj.vertex_groups)))
 
 
 def cleanup_previous_meshes():
-    """
-    Remove previous Skeletal_Mesh_Guide objects if they exist.
-    """
-    objects_to_remove = [obj for obj in bpy.data.objects 
-                         if obj.name.startswith(MESH_GUIDE_NAME)]
-    
-    guide_object_names = {obj.name for obj in objects_to_remove}
-
-    removed_constraints = 0
-    restored_bones = 0
-
-    for armature_obj in bpy.data.objects:
-        if armature_obj.type != 'ARMATURE' or armature_obj.pose is None:
+    objects = [obj for obj in bpy.data.objects if is_guide_object(obj)]
+    removed = restored = 0
+    for armature in bpy.data.objects:
+        if armature.type != 'ARMATURE' or armature.pose is None:
             continue
-
-        for pose_bone in armature_obj.pose.bones:
-            constraints_to_remove = [
-                c for c in pose_bone.constraints
-                if is_weaver_damped_track_constraint(pose_bone, c, guide_object_names)
-            ]
-
-            for constraint in constraints_to_remove:
-                pose_bone.constraints.remove(constraint)
-                removed_constraints += 1
-
-            if constraints_to_remove and restore_pre_constraint_pose(pose_bone):
-                restored_bones += 1
-
-    for obj in objects_to_remove:
-        mesh_data = obj.data
-        bpy.data.objects.remove(obj, do_unlink=True)
-        if mesh_data and mesh_data.users == 0:
-            bpy.data.meshes.remove(mesh_data)
-
-    return len(objects_to_remove), removed_constraints, restored_bones
+        for bone in armature.pose.bones:
+            owned = [c for c in bone.constraints if is_weaver_damped_track_constraint(bone, c)]
+            for c in owned:
+                bone.constraints.remove(c)
+                removed += 1
+            if owned and restore_pre_constraint_pose(bone):
+                restored += 1
+    delete_guide_objects(objects)
+    return len(objects), removed, restored
 
 
 # =============================================================================
 # MAIN OPERATOR
 # =============================================================================
+
+def run_generation(operator, context, generate, *, snap_bones=False):
+    armature = context.active_object
+    selected = list(context.selected_pose_bones or [])
+    if not selected:
+        operator.report({'WARNING'}, "Select bones in Pose Mode")
+        return {'CANCELLED'}
+    selection_before = [obj.name for obj in context.selected_objects]
+    objects_before = set(bpy.data.objects)
+    meshes_before = set(bpy.data.meshes)
+    old_tracks = [(b, c, c.mute) for b in selected for c in b.constraints
+                  if is_weaver_damped_track_constraint(b, c)]
+    old_targets = {c.target for _, c, _ in old_tracks if c.target and is_guide_object(c.target)}
+    # Guide-only builds have no track from which to discover the previous result.
+    names = {b.name for b in selected}
+    old_targets.update(obj for obj in bpy.data.objects
+                       if is_guide_object(obj) and obj.get(SOURCE_KEY) == armature
+                       and obj.get(BONES_KEY) and set(obj[BONES_KEY]).issubset(names))
+    # Keep shared guides if unselected bones or other objects still use them.
+    old_track_ptrs = {c.as_pointer() for _, c, _ in old_tracks}
+    replaceable = {obj for obj in old_targets if not obj.children and not any(
+        getattr(c, 'target', None) == obj and c.as_pointer() not in old_track_ptrs
+        for source in bpy.data.objects
+        for c in list(source.constraints) + ([c for b in source.pose.bones for c in b.constraints]
+                                              if source.type == 'ARMATURE' else []))}
+    pose_before = {b.name: b.matrix_basis.copy() for b in armature.pose.bones}
+    stored_before = {b.name: list(b[WEAVER_PRE_CONSTRAINT_MATRIX])
+                     for b in selected if WEAVER_PRE_CONSTRAINT_MATRIX in b}
+    rest_before = {b.name: (b.head_local.copy(), b.tail_local.copy(), b.use_connect)
+                   for b in armature.data.bones}
+    constraints_before = {c.as_pointer() for b in armature.pose.bones for c in b.constraints}
+    try:
+        for _, c, _ in old_tracks:
+            c.mute = True
+        context.view_layer.update()
+        result = generate(context)
+        if result != {'FINISHED'}:
+            raise ValueError("No simulation generated")
+    except Exception as exc:
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        for b in armature.pose.bones:
+            for c in list(b.constraints):
+                if c.as_pointer() not in constraints_before:
+                    b.constraints.remove(c)
+        for obj in set(bpy.data.objects) - objects_before:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        for mesh in set(bpy.data.meshes) - meshes_before:
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        context.view_layer.objects.active = armature
+        armature.select_set(True)
+        if snap_bones:
+            bpy.ops.object.mode_set(mode='EDIT')
+            for b in armature.data.edit_bones:
+                b.use_connect = False
+            for b in armature.data.edit_bones:
+                b.head, b.tail, _ = rest_before[b.name]
+            for b in armature.data.edit_bones:
+                b.use_connect = rest_before[b.name][2]
+            bpy.ops.object.mode_set(mode='OBJECT')
+        for b in armature.pose.bones:
+            b.matrix_basis = pose_before[b.name]
+        for b in selected:
+            if b.name in stored_before:
+                b[WEAVER_PRE_CONSTRAINT_MATRIX] = stored_before[b.name]
+            elif WEAVER_PRE_CONSTRAINT_MATRIX in b:
+                del b[WEAVER_PRE_CONSTRAINT_MATRIX]
+        for _, c, mute in old_tracks:
+            c.mute = mute
+        bpy.ops.object.mode_set(mode='POSE')
+        for name in selection_before:
+            obj = bpy.data.objects.get(name)
+            if obj is not None:
+                obj.select_set(True)
+        operator.report({'ERROR'}, str(exc))
+        return {'CANCELLED'}
+    for b, c, _ in old_tracks:
+        b.constraints.remove(c)
+    for bone in selected:
+        if (WEAVER_PRE_CONSTRAINT_MATRIX in bone and
+                not any(is_weaver_damped_track_constraint(bone, c) for c in bone.constraints)):
+            del bone[WEAVER_PRE_CONSTRAINT_MATRIX]
+    delete_guide_objects(list(replaceable))
+    for name in selection_before:
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            obj.select_set(True)
+    context.view_layer.update()
+    return {'FINISHED'}
+
 
 class SKELETALWEAVER_OT_weave(Operator):
     bl_idname = "armature.skeletal_weave"
@@ -1208,6 +1193,13 @@ class SKELETALWEAVER_OT_weave(Operator):
         return True
     
     def execute(self, context):
+        props = context.scene.skeletal_weaver_props
+        if not props.create_vertex_groups and (props.use_physics_modifier or props.add_bone_constraints):
+            self.report({'ERROR'}, "Enable Create Vertex Groups for physics or bone constraints")
+            return {'CANCELLED'}
+        return run_generation(self, context, self._execute, snap_bones=props.snap_bones)
+
+    def _execute(self, context):
         armature_obj = context.active_object
         selected_bones = list(context.selected_pose_bones)
         
@@ -1217,11 +1209,8 @@ class SKELETALWEAVER_OT_weave(Operator):
         
         props = context.scene.skeletal_weaver_props
         
-        # Note: Previous meshes are now preserved (not auto-deleted)
-        # Use the cleanup operator manually if needed
-        
-        # STEP 0: Remove existing DAMPED_TRACK constraints to prevent duplicates
-        removed_constraints = remove_damped_track_constraints(selected_bones)
+        # Sample the current pose without previous simulation feedback.
+        # Previous tracks are muted and replaced transactionally by execute().
         
         selected_bone_names = [b.name for b in selected_bones]
         
@@ -1240,11 +1229,14 @@ class SKELETALWEAVER_OT_weave(Operator):
             self.report({'WARNING'}, "Could not identify any mesh groups from selection")
             return {'CANCELLED'}
         
+        if props.use_physics_modifier and props.physics_mode == 'SOFT_BODY':
+            mesh_groups = [dict(group, chain_roots=[root], all_bones=set(trace_chain(root, selected_bones)))
+                           for group in mesh_groups for root in group['chain_roots']]
+
         # Switch to object mode to create meshes
         bpy.ops.object.mode_set(mode='OBJECT')
         
         created_meshes = []
-        all_bone_matrices = []
         
         # Process each mesh group
         for group_idx, mesh_group in enumerate(mesh_groups):
@@ -1274,12 +1266,6 @@ class SKELETALWEAVER_OT_weave(Operator):
                 and max_cols == 1
             )
             vert_indices_matrix = None
-
-            if props.use_physics_modifier and props.physics_mode == 'SOFT_BODY' and max_cols > 1:
-                self.report(
-                    {'WARNING'},
-                    "Soft Body + hooks require a single bone chain; woven mesh was created without Soft Body",
-                )
 
             if max_cols == 1:
                 if use_softbody_here:
@@ -1332,6 +1318,11 @@ class SKELETALWEAVER_OT_weave(Operator):
                     pin_group_name=pin_group_name,
                     vert_indices_matrix=vert_indices_matrix,
                 )
+
+            mesh_obj[OWNER_KEY] = uuid4().hex
+            mesh_obj[ROLE_KEY] = 'GUIDE'
+            mesh_obj[SOURCE_KEY] = armature_obj
+            mesh_obj[BONES_KEY] = sorted(b.name for b in mesh_group['all_bones'])
 
             # Parent to appropriate bone
             parent_mesh_to_armature(mesh_obj, armature_obj, mesh_group['parent_bone'])
@@ -1437,6 +1428,10 @@ class SKELETALWEAVER_OT_clean_bone_names(Operator):
         
         # Store original mode
         original_mode = context.mode
+        rename_map = {}
+        # Capture before Blender's bone renaming updates constraint paths.
+        bindings = [(b.name, c.target, c.subtarget) for b in armature_obj.pose.bones
+                    for c in b.constraints if is_weaver_damped_track_constraint(b, c) and c.target]
         
         # Switch to edit mode to rename bones
         if context.mode != 'EDIT_ARMATURE':
@@ -1467,14 +1462,33 @@ class SKELETALWEAVER_OT_clean_bone_names(Operator):
                 skipped_count += 1
             else:
                 bone.name = new_name
+                rename_map[old_name] = bone.name
                 renamed_count += 1
         
         # Return to original mode
-        if original_mode == 'POSE':
-            bpy.ops.object.mode_set(mode='POSE')
-        elif original_mode == 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='OBJECT')
         
+        # Mesh target groups are not automatically renamed by Blender unless
+        # they deform through this armature; guide meshes only use constraints.
+        for old_name, mesh_obj, old_group in bindings:
+            if old_name not in rename_map or mesh_obj.type != 'MESH':
+                continue
+            new_name = rename_map[old_name]
+            group = mesh_obj.vertex_groups.get(old_group)
+            if group is not None:
+                group.name = new_name  # Blender resolves any Pin/Goal name collision.
+                mapping = dict(mesh_obj.get(TARGETS_KEY, {}))
+                mapping.pop(old_name, None)
+                mapping[new_name] = group.name
+                mesh_obj[TARGETS_KEY] = mapping
+                for c in armature_obj.pose.bones[new_name].constraints:
+                    if is_weaver_damped_track_constraint(armature_obj.pose.bones[new_name], c) and c.target == mesh_obj:
+                        c.subtarget = group.name
+        for mesh_obj in bpy.data.objects:
+            if mesh_obj.get(SOURCE_KEY) == armature_obj and mesh_obj.get(BONES_KEY):
+                mesh_obj[BONES_KEY] = [rename_map.get(name, name) for name in mesh_obj[BONES_KEY]]
+
+        bpy.ops.object.mode_set(mode='EDIT' if original_mode == 'EDIT_ARMATURE' else original_mode)
         if skipped_count > 0:
             self.report({'INFO'}, 
                         f"Renamed {renamed_count} bones, skipped {skipped_count} (name conflicts)")
@@ -1517,7 +1531,7 @@ class SKELETALWEAVER_OT_select_bone_chain(Operator):
 class SKELETALWEAVER_OT_clear_invalid_constraints(Operator):
     bl_idname = "armature.clear_invalid_constraints"
     bl_label = "Clear Invalid Constraints"
-    bl_description = "Remove constraints with missing/invalid targets from selected bones"
+    bl_description = "Remove only plugin tracks with missing or invalid targets from selected bones"
     bl_options = {'REGISTER', 'UNDO'}
     
     @classmethod
@@ -1545,16 +1559,14 @@ class SKELETALWEAVER_OT_clear_invalid_constraints(Operator):
 class SKELETALWEAVER_OT_cleanup_meshes(Operator):
     bl_idname = "armature.cleanup_weaver_meshes"
     bl_label = "Delete All Guide Meshes"
-    bl_description = "Delete all Skeletal_Mesh_Guide meshes created by this addon"
+    bl_description = "Delete all plugin guides, their tracks and unused hook controls"
     bl_options = {'REGISTER', 'UNDO'}
     
     @classmethod
     def poll(cls, context):
-        # Check if any guide meshes exist
-        for obj in bpy.data.objects:
-            if obj.name.startswith(MESH_GUIDE_NAME):
-                return True
-        return False
+        return any(is_guide_object(obj) or (obj.type == 'ARMATURE' and any(
+            is_weaver_damped_track_constraint(b, c) for b in obj.pose.bones for c in b.constraints))
+            for obj in bpy.data.objects)
     
     def execute(self, context):
         deleted_meshes, removed_constraints, restored_bones = cleanup_previous_meshes()
@@ -1643,7 +1655,7 @@ class SKELETALWEAVER_OT_add_hook_from_selection(Operator):
             return False
         if context.mode != 'EDIT_MESH':
             return False
-        return obj.name.startswith(MESH_GUIDE_NAME)
+        return is_guide_object(obj)
 
     def execute(self, context):
         obj = context.edit_object
@@ -1659,37 +1671,13 @@ class SKELETALWEAVER_OT_add_hook_from_selection(Operator):
         prev_mode = context.mode
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        vg_goal = obj.vertex_groups.get("Goal") or obj.vertex_groups.new(name="Goal")
-        for i in indices:
-            vg_goal.add([i], 1.0, 'REPLACE')
-
-        hk_base = "SW_Hook_User"
-        n = 0
-        while True:
-            gname = hk_base if n == 0 else f"{hk_base}_{n:03d}"
-            if gname not in obj.vertex_groups:
-                break
-            n += 1
-        vg_hook = obj.vertex_groups.new(name=gname)
-        for i in indices:
-            vg_hook.add([i], 1.0, 'REPLACE')
-
-        med = _median_world_from_indices(obj, indices)
-        empty = bpy.data.objects.new(_unique_obj_name("SW_Hook_Empty"), None)
-        empty.empty_display_type = 'PLAIN_AXES'
-        empty.empty_display_size = 0.05
-        context.collection.objects.link(empty)
-        empty.matrix_world = Matrix.Translation(med)
-
-        mod = obj.modifiers.new(_unique_obj_name("SW_Hook"), 'HOOK')
-        mod.object = empty
-        mod.vertex_group = gname
+        create_hook(obj, indices, 'SW_Hook_User')
 
         context.view_layer.objects.active = obj
         if prev_mode == 'EDIT_MESH':
             bpy.ops.object.mode_set(mode='EDIT')
 
-        self.report({'INFO'}, "Added Goal weights, Empty, and Hook for %d vertices" % len(indices))
+        self.report({'INFO'}, "Added pin weights, control, and Hook for %d vertices" % len(indices))
         return {'FINISHED'}
 
 
@@ -1700,7 +1688,7 @@ class SKELETALWEAVER_OT_add_hook_from_selection(Operator):
 class SKELETALWEAVER_PT_main(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Skeletal Weaver"
+    bl_category = "Simple Cloth"
     bl_label = "Skeletal Weaver"
     
     def draw(self, context):
@@ -1745,7 +1733,9 @@ class SKELETALWEAVER_PT_main(Panel):
         box = layout.box()
         box.label(text="Mesh Generation", icon='MESH_GRID')
         col = box.column(align=True)
-        col.prop(props, "create_vertex_groups")
+        group_row = col.row()
+        group_row.enabled = not props.create_vertex_groups or not (props.use_physics_modifier or props.add_bone_constraints)
+        group_row.prop(props, "create_vertex_groups")
         col.prop(props, "ribbon_width")
         
         layout.separator()
@@ -1769,9 +1759,12 @@ class SKELETALWEAVER_PT_main(Panel):
             props.pin_use_falloff and props.pin_falloff_pattern != 'TOP_ONLY'
         )
         if show_falloff_params and props.pin_falloff_pattern == 'CUSTOM':
-            brush = get_or_create_pin_falloff_brush()
-            col.template_curve_mapping(brush, "curve_distance_falloff")
-        elif show_falloff_params:
+            brush = bpy.data.brushes.get(PIN_FALLOFF_BRUSH_NAME)
+            if brush:
+                col.template_curve_mapping(brush, "curve_distance_falloff")
+            else:
+                col.operator('armature.weaver_create_pin_curve')
+        elif show_falloff_params and props.pin_falloff_pattern in {'INVERSE', 'EXPONENTIAL'}:
             col.prop(props, "pin_falloff_strength")
         if show_falloff_params:
             col.prop(props, "pin_min_weight")
@@ -1790,7 +1783,7 @@ class SKELETALWEAVER_PT_main(Panel):
         box = layout.box()
         box.label(text="Utilities", icon='TOOL_SETTINGS')
         col = box.column(align=True)
-        col.operator("armature.clear_invalid_constraints", text="Clear Invalid Constraints", 
+        col.operator("armature.clear_invalid_constraints", text="Clear Broken Plugin Tracks",
                      icon='X')
         col.operator("armature.clean_bone_name_suffixes", text="Clean Bone Name Suffixes", 
                      icon='BRUSH_DATA')
@@ -1801,9 +1794,8 @@ class SKELETALWEAVER_PT_main(Panel):
 class SKELETALWEAVER_PT_edit_hooks(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Skeletal Weaver"
+    bl_category = "Simple Cloth"
     bl_label = "Guide Mesh Hooks"
-    bl_context = "mesh_edit"
 
     @classmethod
     def poll(cls, context):
@@ -1811,7 +1803,7 @@ class SKELETALWEAVER_PT_edit_hooks(Panel):
         return (
             obj is not None
             and obj.type == 'MESH'
-            and obj.name.startswith(MESH_GUIDE_NAME)
+            and is_guide_object(obj)
         )
 
     def draw(self, context):
@@ -1826,6 +1818,21 @@ class SKELETALWEAVER_PT_edit_hooks(Panel):
 # =============================================================================
 # PROPERTIES
 # =============================================================================
+
+def update_pin_falloff_pattern(self, context):
+    if self.pin_falloff_pattern == 'CUSTOM':
+        get_or_create_pin_falloff_brush()
+
+
+class SKELETALWEAVER_OT_create_pin_curve(Operator):
+    bl_idname = 'armature.weaver_create_pin_curve'
+    bl_label = 'Create Custom Curve'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        get_or_create_pin_falloff_brush()
+        return {'FINISHED'}
+
 
 class SkeletalWeaverProperties(PropertyGroup):
     snap_bones: BoolProperty(
@@ -1867,13 +1874,13 @@ class SkeletalWeaverProperties(PropertyGroup):
 
     physics_mode: EnumProperty(
         name="Physics Type",
-        description="Cloth (flat/woven ribbon) or Soft Body (extruded ribbon, single chain)",
+        description="Cloth sheets or Soft Body strips (one per chain)",
         items=[
             ('CLOTH', "Cloth", "Cloth simulation using Pin vertex group"),
             (
                 'SOFT_BODY',
                 "Soft Body",
-                "Extruded ribbon + Goal + Soft Body (single chain only); optional hook presets",
+                "One extruded strip per chain, with Goal and optional hooks",
             ),
         ],
         default='CLOTH',
@@ -1918,6 +1925,7 @@ class SkeletalWeaverProperties(PropertyGroup):
             ('CUSTOM', "Custom Curve", "User-defined falloff curve via control points"),
         ],
         default='INVERSE',
+        update=update_pin_falloff_pattern,
     )
 
     pin_falloff_strength: FloatProperty(
@@ -1955,6 +1963,7 @@ classes = (
     SKELETALWEAVER_OT_add_hook_from_selection,
     SKELETALWEAVER_PT_main,
     SKELETALWEAVER_PT_edit_hooks,
+    SKELETALWEAVER_OT_create_pin_curve,
 )
 
 

@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "simple_cloth_simulation"
+version = "1.2.0"
+name = "Simple Cloth Simulation"
+tagline = "Bone-tree cloth, soft body and spring cage drivers"
+maintainer = "Duck Feather <https://github.com/DuckFeather10086/simple_cloth_simulation>"
+type = "add-on"
+
+tags = ["Animation", "Rigging"]
+
+blender_version_min = "5.0.0"
+
+license = [
+  "SPDX:GPL-2.0-or-later",
+]
