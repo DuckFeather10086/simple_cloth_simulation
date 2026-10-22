@@ -79,6 +79,20 @@ class RegionTests(unittest.TestCase):
     def assertClose(self, a, b, epsilon=2e-5):
         self.assertLess((Vector(a) - Vector(b)).length, epsilon, (a, b))
 
+    def test_segment_projection_matches_exhaustive_search_across_batches(self):
+        centers = [Vector(p) for p in [(0, 0, 0), (.2, .1, 0), (.3, -.2, .2), (.9, .1, .1)]]
+        samples = [Vector((i / 9000, .13 * math.sin(i), .05)) for i in range(9001)]
+        indices, fractions = region.nearest_segments(samples, centers)
+        for point, actual_index, actual_fraction in zip(samples, indices, fractions):
+            candidates = []
+            for index, (a, b) in enumerate(zip(centers, centers[1:])):
+                direction = b - a
+                t = max(0., min(1., (point - a).dot(direction) / direction.length_squared))
+                candidates.append(((point - a - t * direction).length_squared, index, t))
+            _, expected_index, expected_fraction = min(candidates)
+            self.assertEqual(actual_index, expected_index)
+            self.assertAlmostEqual(actual_fraction, expected_fraction, places=5)
+
     def test_continuous_region_keeps_unselected_vertices_and_shape_keys(self):
         source, selected = ribbon()
         source.shape_key_add(name='Basis')

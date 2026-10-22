@@ -7,6 +7,7 @@ continuous regions interpolate neighboring proxy frames.
 """
 from uuid import uuid4
 import bpy
+import numpy as np
 from mathutils import Matrix, Vector
 from . import mesh_physics as mesh
 from . import physics_core as core
@@ -35,16 +36,39 @@ def components(obj, selected):
 
 
 def principal_axis(points):
-    center = sum(points, Vector()) / len(points)
-    span = [max(p[i] for p in points) - min(p[i] for p in points) for i in range(3)]
-    axis = Vector((0, 0, 0))
-    axis[max(range(3), key=lambda i: span[i])] = 1
+    coordinates = np.asarray(points, dtype=np.float64)
+    centered = coordinates - coordinates.mean(axis=0)
+    covariance = centered.T @ centered
+    axis = np.zeros(3)
+    axis[np.argmax(np.ptp(coordinates, axis=0))] = 1
     for _ in range(24):
-        value = sum(((p - center) * (p - center).dot(axis) for p in points), Vector())
-        if value.length < 1e-10:
+        value = covariance @ axis
+        length = np.linalg.norm(value)
+        if length < 1e-10:
             raise ValueError('选区没有可辨识的长度方向')
-        axis = value.normalized()
-    return axis
+        axis = value / length
+    return Vector(axis)
+
+
+def nearest_segments(points, centers):
+    """Exact segment projection in batches, without a vertices × nodes array."""
+    points = np.asarray(points, dtype=np.float64)
+    centers = np.asarray(centers, dtype=np.float64)
+    indices = np.zeros(len(points), dtype=np.int32)
+    fractions = np.zeros(len(points), dtype=np.float64)
+    for start in range(0, len(points), 8192):
+        batch = points[start:start + 8192]
+        best = np.full(len(batch), np.inf)
+        for index, direction in enumerate(np.diff(centers, axis=0)):
+            delta = batch - centers[index]
+            fraction = np.clip(np.einsum('ij,j->i', delta, direction) / np.dot(direction, direction), 0., 1.)
+            offset = delta - fraction[:, None] * direction
+            distance = np.einsum('ij,ij->i', offset, offset)
+            closer = distance < best
+            best[closer] = distance[closer]
+            indices[start:start + len(batch)][closer] = index
+            fractions[start:start + len(batch)][closer] = fraction[closer]
+    return indices, fractions
 
 
 def station_groups(obj, coords, selected, structure, count):
@@ -78,11 +102,8 @@ def station_groups(obj, coords, selected, structure, count):
 
 def attr(data, name, kind, values):
     attribute = data.attributes.new(name, kind, 'POINT')
-    for item, value in zip(attribute.data, values):
-        if kind == 'FLOAT_VECTOR':
-            item.vector = value
-        else:
-            item.value = value
+    array = np.asarray(values, dtype=np.int32 if kind == 'INT' else np.float32)
+    attribute.data.foreach_set('vector' if kind == 'FLOAT_VECTOR' else 'value', array.ravel())
     return attribute
 
 
@@ -282,15 +303,9 @@ def create_region(context, source, selected, *, structure='CONTINUOUS', count=16
         if structure == 'CONTINUOUS':
             weights = (mesh.jiggle_weights(source, selected, feather=feather)
                        if len(selected) < size else {i: 1. for i in selected})
-            for i in selected:
-                nearest = None
-                for a in range(len(centers) - 1):
-                    direction = centers[a + 1] - centers[a]
-                    fraction = max(0., min(1., (coords[i] - centers[a]).dot(direction) / direction.length_squared))
-                    distance = (coords[i] - centers[a] - fraction * direction).length_squared
-                    if nearest is None or distance < nearest[0]:
-                        nearest = distance, a, fraction
-                _, indices_a[i], fractions[i] = nearest
+            nearest, projected = nearest_segments([coords[i] for i in selected], centers)
+            for i, segment, fraction in zip(selected, nearest, projected):
+                indices_a[i], fractions[i] = int(segment), float(fraction)
                 indices_b[i], masks[i] = indices_a[i] + 1, weights[i]
         for key, kind, values in [('station', 'INT', station), ('a', 'INT', indices_a),
                                   ('b', 'INT', indices_b), ('t', 'FLOAT', fractions), ('mask', 'FLOAT', masks)]:
@@ -330,14 +345,17 @@ def create_region(context, source, selected, *, structure='CONTINUOUS', count=16
             follow.target, follow.subtarget = rest, group.name
             control.hide_render = True
             control.hide_set(True)
-            context.view_layer.update()
+            helpers[f'node_{i}'] = control
+        # Resolve all animated reference positions once, then bind all nodes.
+        context.view_layer.update()
+        for i in range(len(centers)):
+            control = helpers[f'node_{i}']
             hook = proxy.modifiers.new(f'SCS Reference Hook {i}', 'HOOK')
             hook.object = control
             hook.vertex_indices_set([i])
             hook.matrix_inverse = control.matrix_world.inverted() @ proxy.matrix_world
             proxy.modifiers.move(list(proxy.modifiers).index(hook), list(proxy.modifiers).index(core.solver_for(proxy)))
             reference_hooks[str(i)] = hook.name
-            helpers[f'node_{i}'] = control
         output_tree = deformation_graph(proxy, rest, names, smooth=structure == 'CONTINUOUS')
         output = source.modifiers.new('SCS Chain Region ' + token, 'NODES')
         output.node_group = output_tree

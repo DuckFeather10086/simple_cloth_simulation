@@ -34,6 +34,8 @@ def simulations(context, *, scene_scope=False):
             continue
         if obj.get('scs_region_source') in selected:
             found.add(obj)
+        if obj.get('scs_rope_proxy_source') in selected:
+            found.add(obj)
         if any(m.type == 'HOOK' and m.object in selected for m in obj.modifiers):
             found.add(obj)
         rig = obj.get(sw.SOURCE_KEY)

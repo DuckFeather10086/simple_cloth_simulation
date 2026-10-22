@@ -131,6 +131,7 @@ def add_hook(obj, indices, *, target=None, bone=''):
         bpy.context.collection.objects.link(control)
         control.empty_display_type = 'SPHERE'
         control.empty_display_size = .025
+        control.show_in_front = control.show_name = True
         control.hide_render = True
         control['scs_anchor_source'] = obj
         sw.set_parent_keep_world(control, obj.parent, obj.parent_type, obj.parent_bone,
