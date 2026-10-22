@@ -1,0 +1,38 @@
+{
+  "input": "remiel_swim/delivery/character.blend (local, read-only verification)",
+  "body": "zzz Lady Mesh",
+  "source_vertices": 16556,
+  "collider_vertices": 854,
+  "collider_faces": 1682,
+  "source_modifiers": [
+    "ARMATURE",
+    "CORRECTIVE_SMOOTH",
+    "NODES",
+    "MASK",
+    "SUBSURF"
+  ],
+  "reference_modifiers": [
+    "ARMATURE",
+    "CORRECTIVE_SMOOTH"
+  ],
+  "binding_error_initial": 2.9802322387695312e-08,
+  "poses": [
+    "lForearmBend",
+    "lShin"
+  ],
+  "status": "已构建未验收",
+  "motion_max": 0.48790381721454956,
+  "binding_error_posed": 3.332000937312528e-08,
+  "blender_version": "5.2.0 LTS",
+  "regressions": {
+    "original_weaver": 22,
+    "physics": 10,
+    "mesh_regions": 7,
+    "cloth_body_hooks": 8
+  },
+  "cloth_collision_center_z": {
+    "without": 0.5962252020835876,
+    "with": 0.8160374760627747
+  },
+  "hair_collision_max_difference": 0.09361932302986241
+}

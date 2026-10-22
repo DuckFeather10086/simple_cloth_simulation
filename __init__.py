@@ -9,10 +9,10 @@ from . import physics_ui
 bl_info = {
     "name": "Simple Cloth Simulation",
     "author": "Duck Feather",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Simple Cloth",
-    "description": "Local jiggle, bone cloth, marked chain proxies, Hooks and link assembly",
+    "description": "Jiggle, cloth, hair, chain Hook presets and animated low-poly body colliders",
     "category": "Animation",
 }
 

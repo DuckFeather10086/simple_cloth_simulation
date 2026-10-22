@@ -29,6 +29,11 @@ def endpoints(obj):
     return ends
 
 
+def preset_anchors(obj, preset):
+    head, tail = endpoints(obj)
+    return {'HEAD_ONLY': [head], 'TAIL_ONLY': [tail], 'BOTH_ENDS': [head, tail]}[preset]
+
+
 def validate_mesh(obj):
     if obj.type != 'MESH' or not obj.data.edges:
         raise ValueError('请选择有边的 Mesh')

@@ -20,5 +20,15 @@ with tempfile.TemporaryDirectory(prefix='scs-package-') as temporary:
     proxy = addon.physics_ui.region.create_region(bpy.context, obj, selected, count=4)
     assert proxy['scs_region_source'] == obj
     addon.physics_ui.core.remove_simulations([proxy])
+    bpy.ops.object.armature_add()
+    rig=bpy.context.object
+    obj.modifiers.new('Skin','ARMATURE').object=rig
+    collider=addon.physics_ui.body.create_collider(bpy.context,obj,target_faces=32)
+    assert collider['scs_body_collider_source']==obj
+    addon.physics_ui.body.remove_colliders([collider])
+    pins={v.index:1. for v in obj.data.vertices if v.co.x < -.4}
+    addon.physics_ui.cloth.prepare_cloth(obj,pins)
+    assert addon.physics_ui.core.solver_for(obj).type=='CLOTH'
+    addon.physics_ui.core.remove_simulations([obj])
     addon.unregister()
 print('STANDALONE_PACKAGE_PASS', archive.name, flush=True)

@@ -206,7 +206,7 @@ class PhysicsTests(unittest.TestCase):
         settings = bpy.context.scene.scs_physics
         settings.mode = 'CHAIN'
         settings.chain_input = 'PATH'
-        settings.anchor_mode = 'FIRST'
+        settings.hook_preset = 'HEAD_ONLY'
         self.assertEqual(bpy.ops.scs.create_chain_proxy(), {'FINISHED'})
         obj = bpy.context.object
         self.assertEqual(bpy.ops.scs.create_simulation(), {'FINISHED'})

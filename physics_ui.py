@@ -5,6 +5,8 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, Po
 from . import physics_core as core, mesh_physics as mesh, chain_layout as chain
 from . import skeletal_weaver as sw
 from . import region_physics as region
+from . import cloth_physics as cloth
+from . import body_collider as body
 
 
 class SCSPhysicsSettings(bpy.types.PropertyGroup):
@@ -18,8 +20,11 @@ class SCSPhysicsSettings(bpy.types.PropertyGroup):
         ('THIGH', '大腿', '较紧的回弹起点'), ('BUTT', '臀部', '较重的回弹起点')])
     region: StringProperty(name='抖动权重组', description='留空使用选中顶点；组权重越高越软，不修改原组')
     feather: IntProperty(name='边缘过渡圈数', default=2, min=0, max=10)
-    anchor_mode: EnumProperty(name='初始固定点', items=[('FIRST', '首端', '顶点编号较小的端点'),
-        ('ENDS', '两端', '固定两个端点'), ('SELECTED', '选中顶点', '在编辑模式选择固定点')])
+    hook_preset: EnumProperty(name='链条 Hook 预设', items=[('HEAD_ONLY', '头部 Hook', '编号较小的端点固定'),
+        ('TAIL_ONLY', '尾部 Hook', '编号较大的端点固定'), ('BOTH_ENDS', '两端 Hook', '头尾分别生成控制点')])
+    cloth_pin: StringProperty(name='固定权重组', description='留空使用选中顶点作为固定点；其余顶点模拟')
+    collider_faces: IntProperty(name='目标三角面数', default=2500, min=32, max=50000)
+    collider_margin: FloatProperty(name='体表外扩', default=.003, min=0, max=.1, unit='LENGTH')
     target: PointerProperty(name='Hook 目标', type=bpy.types.Object,
         description='留空则新建控制点；选择物体或骨架，绑定时保留当前偏移')
     bone: StringProperty(name='目标骨骼')
@@ -59,11 +64,13 @@ class SCS_OT_create(bpy.types.Operator):
                 props.use_physics_modifier = props.create_vertex_groups = props.add_bone_constraints = True
                 props.physics_mode = 'SOFT_BODY' if settings.mode == 'CHAIN' else 'CLOTH'
                 if settings.mode == 'CHAIN':
-                    props.softbody_hook_preset = 'HEAD_ONLY'
+                    props.softbody_hook_preset = settings.hook_preset
+                    props.pin_use_falloff = False
+                else:
                     props.pin_use_falloff = False
                 return bpy.ops.armature.skeletal_weave()
-            if obj.type != 'MESH' or settings.mode == 'CLOTH':
-                raise ValueError('头发 / 衣摆请在姿态模式选择骨链；软体和链条可选 Mesh')
+            if obj.type != 'MESH':
+                raise ValueError('请选择 Mesh，或在姿态模式选择骨链')
             if context.mode == 'EDIT_MESH':
                 obj.update_from_editmode()
             indices = [v.index for v in obj.data.vertices if v.select]
@@ -71,13 +78,22 @@ class SCS_OT_create(bpy.types.Operator):
             if settings.mode == 'CHAIN':
                 if settings.chain_input == 'REGION':
                     proxy = region.create_region(context, obj, indices, structure=settings.chain_structure,
-                                                 count=settings.nodes, feather=settings.feather)
+                                                 count=settings.nodes, feather=settings.feather,
+                                                 hook_preset=settings.hook_preset)
                     chain.mark_nodes(proxy)
                 else:
-                    if settings.anchor_mode != 'SELECTED':
-                        indices = mesh.endpoints(obj)[:1 if settings.anchor_mode == 'FIRST' else 2]
+                    indices = mesh.preset_anchors(obj, settings.hook_preset)
                     mesh.prepare_chain(obj, indices)
                     chain.mark_nodes(obj)
+            elif settings.mode == 'CLOTH':
+                if settings.cloth_pin:
+                    group = obj.vertex_groups.get(settings.cloth_pin)
+                    if group is None:
+                        raise ValueError('固定组不存在：' + settings.cloth_pin)
+                    pins = {v.index: g.weight for v in obj.data.vertices for g in v.groups if g.group == group.index}
+                else:
+                    pins = {i: 1. for i in indices}
+                cloth.prepare_cloth(obj, pins, preset=context.scene.skeletal_weaver_props.cloth_structure)
             else:
                 if settings.region:
                     group = obj.vertex_groups.get(settings.region)
@@ -178,6 +194,28 @@ class SCS_OT_manage(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SCS_OT_body_collider(bpy.types.Operator):
+    bl_idname = 'scs.body_collider'
+    bl_label = '身体低模碰撞体'
+    bl_options = {'REGISTER', 'UNDO'}
+    action: EnumProperty(items=[('CREATE', '生成骨架低模碰撞体', ''), ('REMOVE', '移除选中的低模碰撞体', '')])
+
+    def execute(self, context):
+        try:
+            object_mode(context)
+            if self.action == 'CREATE':
+                settings = context.scene.scs_physics
+                collider = body.create_collider(context, context.object, target_faces=settings.collider_faces,
+                                                margin=settings.collider_margin)
+                self.report({'INFO'}, f'已生成 {len(collider.data.polygons)} 面碰撞体，跟随身体动画')
+            else:
+                body.remove_colliders(context.selected_objects)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 def action(layout, operator, text, value):
     layout.operator(operator, text=text).action = value
 
@@ -193,6 +231,7 @@ class SCS_PT_physics(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.scs_physics
+        bone_input = bool(context.object and context.object.type == 'ARMATURE')
         layout.prop(settings, 'mode')
         if settings.mode == 'JIGGLE':
             layout.prop(settings, 'preset')
@@ -203,13 +242,26 @@ class SCS_PT_physics(bpy.types.Panel):
             else:
                 layout.label(text='选身体局部顶点，或已有软体骨骼')
         elif settings.mode == 'CLOTH':
-            layout.label(text='姿态模式选择头发 / 衣摆骨链')
             props = context.scene.skeletal_weaver_props
-            layout.prop(props, 'ribbon_width')
-            layout.prop(props, 'pin_use_falloff')
+            layout.prop(props, 'cloth_structure')
+            if context.object and context.object.type == 'MESH':
+                layout.label(text='直接布片：Tab 只选固定边 / 根部')
+                layout.prop_search(settings, 'cloth_pin', context.object, 'vertex_groups')
+                layout.label(text='空权重组：选中点固定，其余点模拟')
+            else:
+                layout.label(text='姿态模式选择头发 / 衣摆骨链')
+                layout.prop(props, 'ribbon_width')
+                layout.label(text='根部固定；发束各自成带，布片连成面')
         else:
-            layout.prop(settings, 'chain_input')
-            if settings.chain_input == 'REGION':
+            layout.prop(settings, 'hook_preset')
+            if bone_input:
+                layout.label(text='姿态模式选择悬吊骨链')
+                layout.label(text='生成后可选代理网格手动添加 Hook')
+            else:
+                layout.prop(settings, 'chain_input')
+            if bone_input:
+                layout.prop(context.scene.skeletal_weaver_props, 'ribbon_width')
+            elif settings.chain_input == 'REGION':
                 layout.label(text='Tab 选择原 Mesh 中需要模拟的部分')
                 layout.prop(settings, 'chain_structure')
                 if settings.chain_structure == 'CONTINUOUS':
@@ -222,9 +274,8 @@ class SCS_PT_physics(bpy.types.Panel):
                 box.prop(settings, 'length')
                 box.operator('scs.create_chain_proxy')
                 layout.label(text='Tab 编辑路径，再生成模拟')
-                layout.prop(settings, 'anchor_mode')
         layout.operator('scs.create_simulation', icon='PHYSICS')
-        if settings.mode == 'CHAIN':
+        if settings.mode == 'CHAIN' and not bone_input:
             box = layout.box()
             box.label(text='节点与 Hook')
             row = box.row(align=True)
@@ -280,9 +331,17 @@ class SCS_PT_controls(bpy.types.Panel):
                                     ('tension_damping', '阻尼'), ('quality', '求解质量')]:
                     col.prop(native, name, text=label)
                 col.prop(mod.collision_settings, 'use_collision', text='碰撞')
+                col.prop(mod.collision_settings, 'distance_min', text='碰撞间距')
+                col.prop(mod.collision_settings, 'collision_quality', text='碰撞质量')
+                col.prop(mod.collision_settings, 'use_self_collision', text='自碰撞')
             col.prop(native.effector_weights, 'gravity', text='重力影响')
         box = layout.box()
-        box.label(text='碰撞：先在物体模式选身体 / 障碍物')
+        box.label(text='身体低模：选择已绑定骨架的身体 Mesh')
+        box.prop(settings, 'collider_faces')
+        box.prop(settings, 'collider_margin')
+        action(box, 'scs.body_collider', '生成骨架低模碰撞体', 'CREATE')
+        action(box, 'scs.body_collider', '移除低模碰撞体', 'REMOVE')
+        box.label(text='普通障碍物：选择物体后添加碰撞')
         action(box, 'scs.manage', '添加碰撞物', 'COLLIDE')
         action(box, 'scs.manage', '移除本工具添加的碰撞', 'UNCOLLIDE')
         row = layout.row(align=True)
@@ -297,7 +356,7 @@ class SCS_PT_controls(bpy.types.Panel):
         action(layout, 'scs.manage', '移除当前范围的模拟', 'REMOVE')
 
 
-CLASSES = (SCSPhysicsSettings, SCS_OT_create, SCS_OT_proxy, SCS_OT_chain, SCS_OT_manage,
+CLASSES = (SCSPhysicsSettings, SCS_OT_create, SCS_OT_proxy, SCS_OT_chain, SCS_OT_manage, SCS_OT_body_collider,
            SCS_PT_physics, SCS_PT_controls)
 
 

@@ -842,12 +842,14 @@ def create_vertex_groups(
     mesh_obj[TARGETS_KEY] = {name: group.name for name, group in target_groups.items()}
 
 
-def add_cloth_modifier(mesh_obj):
+def add_cloth_modifier(mesh_obj, preset='FABRIC'):
     """
     Add cloth modifier to mesh with Pin vertex group.
     """
     cloth_mod = mesh_obj.modifiers.new("Cloth", 'CLOTH')
     cloth_mod.settings.vertex_group_mass = "Pin"
+    from .cloth_physics import configure_cloth
+    configure_cloth(cloth_mod, preset)
     set_cache_range(cloth_mod)
     return cloth_mod
 
@@ -900,6 +902,8 @@ def _median_world_from_indices(mesh_obj, indices):
 def setup_softbody_hook_presets(mesh_obj, preset, vert_indices_matrix):
     if preset == 'NONE' or not vert_indices_matrix:
         return
+    # Tail-only must release the originally pinned head row as well.
+    mesh_obj.vertex_groups['Goal'].add(list(range(len(mesh_obj.data.vertices))), 0., 'REPLACE')
     if preset in ('BOTH_ENDS', 'HEAD_ONLY'):
         indices = [i for column in vert_indices_matrix for i in column[0]]
         create_hook(mesh_obj, indices, HOOK_GROUP_HEAD)
@@ -1229,7 +1233,7 @@ class SKELETALWEAVER_OT_weave(Operator):
             self.report({'WARNING'}, "Could not identify any mesh groups from selection")
             return {'CANCELLED'}
         
-        if props.use_physics_modifier and props.physics_mode == 'SOFT_BODY':
+        if props.use_physics_modifier and (props.physics_mode == 'SOFT_BODY' or props.cloth_structure == 'HAIR'):
             mesh_groups = [dict(group, chain_roots=[root], all_bones=set(trace_chain(root, selected_bones)))
                            for group in mesh_groups for root in group['chain_roots']]
 
@@ -1343,7 +1347,7 @@ class SKELETALWEAVER_OT_weave(Operator):
         # Add simulation modifiers
         if props.use_physics_modifier and props.physics_mode == 'CLOTH':
             for mesh_info in created_meshes:
-                add_cloth_modifier(mesh_info['obj'])
+                add_cloth_modifier(mesh_info['obj'], props.cloth_structure)
         elif props.use_physics_modifier and props.physics_mode == 'SOFT_BODY':
             for mesh_info in created_meshes:
                 if mesh_info.get('softbody_eligible'):
@@ -1837,6 +1841,9 @@ class SKELETALWEAVER_OT_create_pin_curve(Operator):
 
 
 class SkeletalWeaverProperties(PropertyGroup):
+    cloth_structure: EnumProperty(
+        name='布料结构', items=[('FABRIC', '布片 / 衣摆', '相邻骨链织成面'),
+                               ('HAIR', '独立发束', '每条骨链生成独立窄带')], default='FABRIC')
     snap_bones: BoolProperty(
         name="Snap Bones",
         description="Snap close bone endpoints together before generating mesh",

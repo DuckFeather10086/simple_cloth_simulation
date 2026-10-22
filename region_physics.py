@@ -217,7 +217,8 @@ def deformation_graph(proxy, rest, names, *, smooth=False):
     return graph.finish(offset=graph.vector('SCALE', delta, graph.named(names['mask'], 'FLOAT')))
 
 
-def create_region(context, source, selected, *, structure='CONTINUOUS', count=16, feather=2):
+def create_region(context, source, selected, *, structure='CONTINUOUS', count=16, feather=2,
+                  hook_preset=None):
     insertion = mesh.validate_mesh(source)
     if any(m.type == 'COLLISION' for m in source.modifiers):
         raise ValueError('局部模拟网格不能同时作为自身碰撞物；请使用独立碰撞网格')
@@ -238,7 +239,8 @@ def create_region(context, source, selected, *, structure='CONTINUOUS', count=16
     objects_before, groups_before = set(bpy.data.objects), set(bpy.data.node_groups)
     meshes_before = set(bpy.data.meshes)
     sharing = [o for o in bpy.data.objects if o.type == 'MESH' and o.data == source.data and o != source]
-    own_references = [o for o in sharing if o.get('scs_region_reference_for') == source]
+    own_references = [o for o in sharing if o.get('scs_region_reference_for') == source
+                      or o.get('scs_body_collider_reference') == source]
     copied = any(o not in own_references for o in sharing)
     try:
         if copied:
@@ -315,7 +317,8 @@ def create_region(context, source, selected, *, structure='CONTINUOUS', count=16
         proxy.hide_render = True
         # Soft Body requires original mesh data, so reference positions enter
         # through native per-node Hooks rather than Geometry Nodes before it.
-        mesh.prepare_chain(proxy, [0], automatic_hooks=False)
+        anchors = mesh.preset_anchors(proxy, hook_preset or 'HEAD_ONLY')
+        mesh.prepare_chain(proxy, anchors, automatic_hooks=False)
         helpers = {'reference': reference, 'rest': rest}
         reference_hooks = {}
         for i in range(len(centers)):
@@ -346,6 +349,13 @@ def create_region(context, source, selected, *, structure='CONTINUOUS', count=16
         proxy['scs_region_reference_hooks'] = reference_hooks
         proxy['scs_region_trees'] = [tree.name, output_tree.name]
         proxy['scs_region_structure'] = structure
+        if hook_preset:
+            for index in anchors:
+                control = mesh.add_hook(proxy, [index])
+                # The preset handle follows its original animated station;
+                # users can offset it or rebind the node to a chosen target.
+                from . import skeletal_weaver as sw
+                sw.set_parent_keep_world(control, helpers[f'node_{index}'], 'OBJECT', '', control.matrix_world.copy())
         for obj in context.selected_objects:
             obj.select_set(False)
         proxy.select_set(True)
