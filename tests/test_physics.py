@@ -205,6 +205,7 @@ class PhysicsTests(unittest.TestCase):
     def test_ui_chain_flow_and_edit_hook(self):
         settings = bpy.context.scene.scs_physics
         settings.mode = 'CHAIN'
+        settings.chain_input = 'PATH'
         settings.anchor_mode = 'FIRST'
         self.assertEqual(bpy.ops.scs.create_chain_proxy(), {'FINISHED'})
         obj = bpy.context.object

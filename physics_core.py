@@ -32,6 +32,8 @@ def simulations(context, *, scene_scope=False):
     for obj in context.scene.objects:
         if not solver_for(obj):
             continue
+        if obj.get('scs_region_source') in selected:
+            found.add(obj)
         if any(m.type == 'HOOK' and m.object in selected for m in obj.modifiers):
             found.add(obj)
         rig = obj.get(sw.SOURCE_KEY)
@@ -110,6 +112,8 @@ def add_colliders(objects):
         raise ValueError('在物体模式选择身体或其他碰撞网格')
     if any((solver_for(o) and o.get(KIND) != 'JIGGLE') or sw.is_guide_object(o) for o in meshes):
         raise ValueError('请选择碰撞物，模拟网格不能同时作为本工具的碰撞物')
+    if any(o.get('scs_region_source') in meshes for o in bpy.data.objects):
+        raise ValueError('局部模拟网格不能同时作为自身碰撞物；请选择独立碰撞网格')
     for obj in meshes:
         if not any(m.type == 'COLLISION' for m in obj.modifiers):
             mod = obj.modifiers.new('SCS Collision', 'COLLISION')
@@ -138,7 +142,31 @@ def remove_simulations(objects):
         for child in list(bpy.data.objects):
             if child.get('scs_chain_source') == obj:
                 bpy.data.objects.remove(child, do_unlink=True)
-        if sw.is_guide_object(obj):
+        if obj.get('scs_region_source'):
+            source = obj['scs_region_source']
+            name = obj['scs_region_modifier']
+            modifier = source.modifiers.get(name)
+            if modifier:
+                source.modifiers.remove(modifier)
+            attributes = list(obj['scs_region_attributes'])
+            trees = list(obj['scs_region_trees'])
+            helpers = list(obj['scs_region_helpers'].values())
+            helpers += [m.object for m in obj.modifiers if m.type == 'HOOK' and m.object
+                        and m.object.get('scs_anchor_source') == obj]
+            for helper in helpers + [obj]:
+                data = helper.data
+                bpy.data.objects.remove(helper, do_unlink=True)
+                if isinstance(data, bpy.types.Mesh) and data.users == 0:
+                    bpy.data.meshes.remove(data)
+            for name in attributes:
+                attribute = source.data.attributes.get(name)
+                if attribute:
+                    source.data.attributes.remove(attribute)
+            for name in trees:
+                tree = bpy.data.node_groups.get(name)
+                if tree and tree.users == 0:
+                    bpy.data.node_groups.remove(tree)
+        elif sw.is_guide_object(obj):
             for rig in bpy.data.objects:
                 if rig.type != 'ARMATURE':
                     continue

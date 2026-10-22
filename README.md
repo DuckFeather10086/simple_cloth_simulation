@@ -2,11 +2,34 @@
 
 在原来的 **N → Simple Cloth** 中统一身体局部抖动、头发 / 衣摆、悬吊链条、碰撞和缓存。扩展 ID 沿用 `simple_cloth_simulation`，无需另外安装一套插件。
 
-**状态：已构建、未验收。** Blender 5.2.0 LTS 的 22 项原有回归与 10 项新增回归通过；已经检查下方链条模拟预览。胸部 / 大腿 / 臀部参数是可调起点，尚未以实际角色长动画验收，不等同于 Jiggle Maker 的效果复刻。
+**状态：已构建、未验收。** Blender 5.2.0 LTS 的 39 项回归通过；已经检查链条模拟预览。胸部 / 大腿 / 臀部参数是可调起点，尚未以实际角色长动画验收，不等同于 Jiggle Maker 的效果复刻。
 
-## 链条：指定 Hook，再沿节点排列链节
+## 链条主入口：给原 Mesh 的选区添加模拟
 
-1. 模式选 **悬吊链条**。在游标处新建代理，或选择已有的绳中心线 Mesh；Tab 编辑路径。自动排列外观目前要求单条开放边链。
+默认入口为 **悬吊链条 → 原 Mesh 的选区**。目标是只让同一 Mesh 里指定的部分参与模拟，仍然输出原来的一个 Mesh。
+
+1. 在原 Mesh 编辑模式选中需要模拟的部分。
+2. **连续网格**用于绳、带、鞭身、垂挂饰物：选择代理节点数与选区边缘过渡圈数。**独立链环**用于同一 Mesh 内已经建好的链环：选完整链环，每个环生成一个代理节点。
+3. 点 **生成模拟**。自动生成动画参考路径、软体代理和原网格的局部驱动；选区外的顶点不参与该驱动。默认第一个节点固定跟随原动画。
+4. 选择代理上的编号球，在 **Hook 目标**里指定物体 / Empty / 骨架和骨骼。端点和中间点都能指定；目标为空则新建控制点。
+5. 原网格保持一个 Mesh。连续网格沿路径平滑弯曲；独立链环保持环内距离，只逐环转动和移动。骨架动画与模拟按相对变化叠加，避免双倍位移。
+6. 同一 Mesh 可建立多个互不重叠的区域。选原 Mesh 可管理它的全部区域；选某个代理或编号球只管理对应区域。移除模拟恢复原输入，不删除原网格或手工指定的 Hook 目标。
+
+以下是同一个原 Mesh：青色三个链环未选中，金色八个链环参与模拟。没有重新排列或复制渲染链环。
+
+![原 Mesh 局部模拟之前](docs/images/local-chain-01.png)
+
+![原 Mesh 局部链环模拟](docs/images/local-chain-12.png)
+
+![原 Mesh 连续选区模拟](docs/images/continuous-chain-12.png)
+
+代理按选区主要延伸方向 / 相邻链环中心自动排序。当前适合单条延伸路径；强回折、分叉或多条交错路径应分开选区。独立链环模式不会把只选半个环偷偷扩选为整个环，而是报错提示。原动画应保持顶点对应关系；已有原生 Cloth / Soft Body 或拓扑变化位于动画之前的修改器栈需先准备可对应的输入。局部模拟网格不能同时作为自己的碰撞物，身体 / 障碍物需使用独立碰撞 Mesh，避免循环依赖。模拟使用代理弹簧，尚不保证逐环机械互扣、自碰撞或严格不可伸长。
+
+## 辅助入口：新建代理并排列链节外观
+
+选择 **独立代理 / 新建链条**，用于从中心线创建新链条外观；已有 Mesh 选区使用上面的主入口。
+
+1. 模式选 **悬吊链条 → 独立代理 / 新建链条**。在游标处新建代理，或选择已有的绳中心线 Mesh；Tab 编辑路径。自动排列外观目前要求单条开放边链。
 2. 选首端、两端或手选顶点作为初始固定点，点 **生成模拟**。固定点会有独立 Hook，代理每个顶点显示编号球。
 3. 选择任意编号球（可多选），或 Tab 选代理顶点。在 **Hook 目标**指定已有物体 / Empty；选骨架时可再指定骨骼。点 **指定 Hook**。留空目标则新建控制点。
 4. 绑定时保留当前偏移，不会把代理点瞬移到目标原点。改绑同一节点会移除它在旧 Hook 中的影响，其余节点保留。目标可以动画；不要再用代理自身或它的节点标记作 Hook 目标。
@@ -95,9 +118,12 @@
 ```text
 blender --background --factory-startup --python-exit-code 1 -P tests/test_blender.py -- --output-dir <临时输出目录>
 blender --background --factory-startup --python-exit-code 1 -P tests/test_physics.py
+blender --background --factory-startup --python-exit-code 1 -P tests/test_regions.py
 blender --background --factory-startup --python-exit-code 1 -P tests/preview_physics.py
+blender --background --factory-startup --python-exit-code 1 -P tests/preview_regions.py
+blender --background --factory-startup --python-exit-code 1 -P tests/preview_regions.py -- --continuous
 ```
 
-Blender 5.2.0 LTS 后台通过 **32 项回归**。原有 22 项覆盖 Hook 连续帧对照、部分骨重建、保留用户约束、异常回滚和保存重开。新增 10 项覆盖实际碰撞、骨骼 / 物体 Hook、局部抖动与原动画叠加、形态键 / 权重保留、节点和链节随动、缓存重开、实际 UI 操作入口及清理归属。未用实际角色长动画验证碰撞稳定性；Blender 5.0/5.1 本轮未实测。
+Blender 5.2.0 LTS 后台通过 **39 项回归**。原有 22 项覆盖 Hook 连续帧对照、部分骨重建、保留用户约束、异常回滚和保存重开。新增 10 项覆盖实际碰撞、骨骼 / 物体 Hook、局部抖动与原动画叠加、形态键 / 权重保留、节点和链节随动、缓存重开、实际 UI 操作入口及清理归属。另有 7 项覆盖原 Mesh 连续 / 独立链环选区、选区外保留、逐环刚性、原动画不双倍、Hook 绝对跟随、区域烘焙重开、多个区域隔离、编辑模式入口和失败回滚。未用实际角色长动画验证碰撞稳定性；Blender 5.0/5.1 本轮未实测。
 
-链条示例输出：`out/unified-physics/demo/chain-demo.blend`。局部抖动实测选区位移约 0.01145 Blender 单位，选区外保持固定；链条地面碰撞对照：末端无碰撞 z=-0.15356，有碰撞 z=0.00285。这些是合成场景的数值证据，不是角色成品验收。
+局部选区示例：`out/unified-physics/regions/local-chain-demo.blend`、`continuous-chain-demo.blend`。新建链条示例：`out/unified-physics/demo/chain-demo.blend`。逐环刚性实测环内距离最大变化约 8.2e-8 Blender 单位；局部抖动实测选区位移约 0.01145，选区外保持固定；链条地面碰撞对照：末端无碰撞 z=-0.15356，有碰撞 z=0.00285。这些是合成场景的数值证据，不是角色成品验收。

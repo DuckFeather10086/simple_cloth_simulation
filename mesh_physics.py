@@ -51,7 +51,7 @@ def validate_mesh(obj):
     return insertion
 
 
-def prepare_chain(obj, anchors, *, mass=.3, stiffness=.9, damping=2.):
+def prepare_chain(obj, anchors, *, mass=.3, stiffness=.9, damping=2., automatic_hooks=True):
     insertion = validate_mesh(obj)
     indices = sorted(set(anchors))
     if not indices or any(i < 0 or i >= len(obj.data.vertices) for i in indices):
@@ -75,8 +75,9 @@ def prepare_chain(obj, anchors, *, mass=.3, stiffness=.9, damping=2.):
     sw.set_cache_range(mod)
     obj[core.KIND], obj[core.SOLVER] = 'CHAIN', mod.name
     obj[core.GROUPS] = [group.name]
-    for index in indices:
-        add_hook(obj, [index])
+    if automatic_hooks:
+        for index in indices:
+            add_hook(obj, [index])
     return mod
 
 
@@ -115,6 +116,7 @@ def add_hook(obj, indices, *, target=None, bone=''):
         bpy.context.view_layer.update()
         evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
         center = sum((evaluated.data.vertices[i].co for i in indices), Vector()) / len(indices)
+        positions = {i: evaluated.data.vertices[i].co.copy() for i in indices}
     finally:
         for m, state in zip(suffix, states):
             m.show_viewport = state
@@ -132,6 +134,13 @@ def add_hook(obj, indices, *, target=None, bone=''):
     target_matrix = (control.matrix_world @ control.pose.bones[bone].matrix
                      if bone else control.matrix_world)
     inverse = target_matrix.inverted() @ obj.matrix_world
+    if obj.get('scs_region_source'):
+        for index, coordinate in positions.items():
+            reference_name = obj['scs_region_reference_hooks'].get(str(index))
+            reference_hook = obj.modifiers.get(reference_name) if reference_name else None
+            if reference_hook:
+                obj.modifiers.remove(reference_hook)
+            obj.data.vertices[index].co = coordinate
     # Reassign selected nodes instead of stacking two competing Hook transforms.
     for existing in list(obj.modifiers):
         if existing.type != 'HOOK' or existing.name not in obj.get('scs_physics_hooks', []):

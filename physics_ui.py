@@ -4,11 +4,16 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from . import physics_core as core, mesh_physics as mesh, chain_layout as chain
 from . import skeletal_weaver as sw
+from . import region_physics as region
 
 
 class SCSPhysicsSettings(bpy.types.PropertyGroup):
     mode: EnumProperty(name='用途', items=[('JIGGLE', '软体抖动', '身体网格选区或已有软体骨骼'),
         ('CLOTH', '头发 / 衣摆', '沿用骨树织网'), ('CHAIN', '悬吊链条', '代理节点、指定 Hook、链节排列')], default='CHAIN')
+    chain_input: EnumProperty(name='作用对象', items=[('REGION', '原 Mesh 的选区', '给现有网格的一部分添加模拟'),
+        ('PATH', '独立代理 / 新建链条', '直接模拟绳中心线，可沿节点排列新链节')], default='REGION')
+    chain_structure: EnumProperty(name='选区结构', items=[('CONTINUOUS', '连续网格', '绳、带、垂挂部分沿路径平滑弯曲'),
+        ('RINGS', '独立链环', '同一 Mesh 内每个不相连链环保持自身形状')])
     preset: EnumProperty(name='部位', items=[('BREAST', '胸部', '柔软回弹起点'),
         ('THIGH', '大腿', '较紧的回弹起点'), ('BUTT', '臀部', '较重的回弹起点')])
     region: StringProperty(name='抖动权重组', description='留空使用选中顶点；组权重越高越软，不修改原组')
@@ -64,10 +69,15 @@ class SCS_OT_create(bpy.types.Operator):
             indices = [v.index for v in obj.data.vertices if v.select]
             object_mode(context)
             if settings.mode == 'CHAIN':
-                if settings.anchor_mode != 'SELECTED':
-                    indices = mesh.endpoints(obj)[:1 if settings.anchor_mode == 'FIRST' else 2]
-                mesh.prepare_chain(obj, indices)
-                chain.mark_nodes(obj)
+                if settings.chain_input == 'REGION':
+                    proxy = region.create_region(context, obj, indices, structure=settings.chain_structure,
+                                                 count=settings.nodes, feather=settings.feather)
+                    chain.mark_nodes(proxy)
+                else:
+                    if settings.anchor_mode != 'SELECTED':
+                        indices = mesh.endpoints(obj)[:1 if settings.anchor_mode == 'FIRST' else 2]
+                    mesh.prepare_chain(obj, indices)
+                    chain.mark_nodes(obj)
             else:
                 if settings.region:
                     group = obj.vertex_groups.get(settings.region)
@@ -95,6 +105,7 @@ class SCS_OT_proxy(bpy.types.Operator):
     def execute(self, context):
         object_mode(context)
         settings = context.scene.scs_physics
+        settings.chain_input = 'PATH'
         chain.create_proxy(context, settings.nodes, settings.length)
         return {'FINISHED'}
 
@@ -197,12 +208,21 @@ class SCS_PT_physics(bpy.types.Panel):
             layout.prop(props, 'ribbon_width')
             layout.prop(props, 'pin_use_falloff')
         else:
-            box = layout.box()
-            box.prop(settings, 'nodes')
-            box.prop(settings, 'length')
-            box.operator('scs.create_chain_proxy')
-            layout.label(text='Tab 编辑路径，再生成模拟')
-            layout.prop(settings, 'anchor_mode')
+            layout.prop(settings, 'chain_input')
+            if settings.chain_input == 'REGION':
+                layout.label(text='Tab 选择原 Mesh 中需要模拟的部分')
+                layout.prop(settings, 'chain_structure')
+                if settings.chain_structure == 'CONTINUOUS':
+                    layout.prop(settings, 'nodes')
+                    layout.prop(settings, 'feather')
+                layout.label(text='生成后选编号节点指定 Hook')
+            else:
+                box = layout.box()
+                box.prop(settings, 'nodes')
+                box.prop(settings, 'length')
+                box.operator('scs.create_chain_proxy')
+                layout.label(text='Tab 编辑路径，再生成模拟')
+                layout.prop(settings, 'anchor_mode')
         layout.operator('scs.create_simulation', icon='PHYSICS')
         if settings.mode == 'CHAIN':
             box = layout.box()
@@ -215,16 +235,17 @@ class SCS_PT_physics(bpy.types.Panel):
             if settings.target and settings.target.type == 'ARMATURE':
                 box.prop_search(settings, 'bone', settings.target.data, 'bones')
             action(box, 'scs.chain_action', '指定 Hook（空目标则新建）', 'HOOK')
-            box = layout.box()
-            box.label(text='沿代理排列实际链节')
-            box.prop(settings, 'template')
-            box.prop(settings, 'axis')
-            box.prop(settings, 'alternate')
-            box.prop(settings, 'fit')
-            if settings.fit:
-                box.prop(settings, 'pitch')
-            action(box, 'scs.chain_action', '排列 / 更新链节', 'LINKS')
-            action(box, 'scs.chain_action', '移除链节外观', 'CLEAR')
+            if settings.chain_input == 'PATH':
+                box = layout.box()
+                box.label(text='沿代理排列实际链节')
+                box.prop(settings, 'template')
+                box.prop(settings, 'axis')
+                box.prop(settings, 'alternate')
+                box.prop(settings, 'fit')
+                if settings.fit:
+                    box.prop(settings, 'pitch')
+                action(box, 'scs.chain_action', '排列 / 更新链节', 'LINKS')
+                action(box, 'scs.chain_action', '移除链节外观', 'CLEAR')
 
 
 class SCS_PT_controls(bpy.types.Panel):

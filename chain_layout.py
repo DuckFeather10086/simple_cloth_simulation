@@ -30,8 +30,13 @@ def create_proxy(context, count=16, length=1.):
 
 def proxy_from(context):
     obj = context.object
+    if obj is None:
+        return None
     if obj and obj.get(SOURCE):
         return obj[SOURCE]
+    regions = [o for o in context.scene.objects if o.get('scs_region_source') == obj]
+    if len(regions) == 1:
+        return regions[0]
     return obj if obj and obj.type == 'MESH' and core.solver_for(obj) else None
 
 
