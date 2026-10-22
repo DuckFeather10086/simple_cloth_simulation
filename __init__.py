@@ -4,14 +4,15 @@ import bpy
 from . import simple_cloth_simulation
 from . import skeletal_weaver
 from . import bone_swing
+from . import physics_ui
 
 bl_info = {
     "name": "Simple Cloth Simulation",
     "author": "Duck Feather",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Simple Cloth",
-    "description": "Cloth simulation and skeletal weaver mesh generator for armatures",
+    "description": "Local jiggle, bone cloth, marked chain proxies, Hooks and link assembly",
     "category": "Animation",
 }
 
@@ -20,9 +21,11 @@ def register():
     simple_cloth_simulation.register()
     skeletal_weaver.register()
     bone_swing.register()
+    physics_ui.register()
 
 
 def unregister():
+    physics_ui.unregister()
     bone_swing.unregister()
     skeletal_weaver.unregister()
     simple_cloth_simulation.unregister()

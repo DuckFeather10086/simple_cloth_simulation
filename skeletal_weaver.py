@@ -1689,7 +1689,9 @@ class SKELETALWEAVER_PT_main(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Simple Cloth"
-    bl_label = "Skeletal Weaver"
+    bl_label = "骨链织网 · 高级设置"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 2
     
     def draw(self, context):
         layout = self.layout
