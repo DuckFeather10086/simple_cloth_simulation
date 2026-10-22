@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import unittest
 import bpy
+import bmesh
 from mathutils import Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -56,6 +57,77 @@ class PhysicsTests(unittest.TestCase):
 
     def assertClose(self, a, b, tolerance=1e-4):
         self.assertLess((Vector(a) - Vector(b)).length, tolerance, (a, b))
+
+    def test_hook_button_from_edit_mode_selects_handle_and_returns_to_proxy(self):
+        obj = make_chain()
+        before = evaluated_points(obj)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        edit = bmesh.from_edit_mesh(obj.data)
+        edit.verts.ensure_lookup_table()
+        edit.verts[5].select_set(True)
+        bmesh.update_edit_mesh(obj.data)
+        self.assertEqual(bpy.ops.scs.chain_action(action='NEW_HOOK'), {'FINISHED'})
+        handle = bpy.context.object
+        self.assertEqual(bpy.context.mode, 'OBJECT')
+        self.assertEqual(handle.get('scs_anchor_source'), obj)
+        self.assertTrue(handle.select_get() and handle.show_in_front)
+        self.assertEqual(chain.proxy_from(bpy.context), obj)
+        for actual, expected in zip(evaluated_points(obj), before):
+            self.assertClose(actual, expected)
+        handle.location.y += .1
+        simulate()
+        self.assertAlmostEqual(evaluated_points(obj)[5].y, .1, places=4)
+        self.assertEqual(bpy.ops.scs.chain_action(action='EDIT'), {'FINISHED'})
+        self.assertEqual(bpy.context.edit_object, obj)
+        self.assertFalse(any(v.select for v in bmesh.from_edit_mesh(obj.data).verts))
+
+    def test_marker_hook_button_ignores_stale_target(self):
+        obj = make_chain()
+        chain.mark_nodes(obj)
+        marker = next(o for o in bpy.data.objects if o.get(chain.SOURCE) == obj and o.get(chain.NODE) == 5)
+        bpy.context.scene.scs_physics.target = obj  # New Hook must ignore this invalid binding target.
+        for selected in bpy.context.selected_objects:
+            selected.select_set(False)
+        marker.select_set(True)
+        bpy.context.view_layer.objects.active = marker
+        self.assertEqual(bpy.ops.scs.chain_action(action='NEW_HOOK'), {'FINISHED'})
+        self.assertEqual(bpy.context.object.get('scs_anchor_source'), obj)
+        bpy.context.scene.scs_physics.target = None
+
+    def test_disconnected_edge_paths_accept_selected_anchors_before_geometry_nodes(self):
+        data = bpy.data.meshes.new('Two edge paths')
+        data.from_pydata([(i * .05, y, 1.) for y in (0., .1) for i in range(6)],
+                         [(offset + i, offset + i + 1) for offset in (0, 6) for i in range(5)], [])
+        obj = bpy.data.objects.new('Two edge paths', data)
+        bpy.context.collection.objects.link(obj)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        graph = bpy.data.node_groups.new('Existing Appearance', 'GeometryNodeTree')
+        graph.interface.new_socket(name='Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')
+        graph.interface.new_socket(name='Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+        graph.links.new(graph.nodes.new('NodeGroupInput').outputs['Geometry'],
+                        graph.nodes.new('NodeGroupOutput').inputs['Geometry'])
+        obj.modifiers.new('Existing Appearance', 'NODES').node_group = graph
+        settings = bpy.context.scene.scs_physics
+        settings.mode, settings.chain_input, settings.path_anchors = 'CHAIN', 'PATH', 'SELECTED'
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        edit = bmesh.from_edit_mesh(data)
+        edit.verts.ensure_lookup_table()
+        for i in (0, 6):
+            edit.verts[i].select_set(True)
+        bmesh.update_edit_mesh(data)
+        self.assertEqual(bpy.ops.scs.create_simulation(), {'FINISHED'})
+        self.assertEqual([m.type for m in obj.modifiers], ['HOOK', 'SOFT_BODY', 'NODES'])
+        simulate()
+        actual = evaluated_points(obj)
+        for i in (0, 6):
+            self.assertAlmostEqual(actual[i].z, 1., places=4)
+        for i in (5, 11):
+            self.assertLess(actual[i].z, .99)
+        self.assertEqual(obj.modifiers[-1].node_group, graph)
+        settings.path_anchors = 'PRESET'
 
     def test_gravity_and_arbitrary_hook_reassignment(self):
         obj = make_chain()
@@ -212,6 +284,9 @@ class PhysicsTests(unittest.TestCase):
         self.assertEqual(bpy.ops.scs.create_simulation(), {'FINISHED'})
         for v in obj.data.vertices:
             v.select = v.index == 5
+        target = bpy.data.objects.new('UI Hook Target', None)
+        bpy.context.collection.objects.link(target)
+        settings.target = target
         bpy.ops.object.mode_set(mode='EDIT')
         self.assertEqual(bpy.ops.scs.chain_action(action='HOOK'), {'FINISHED'})
         self.assertEqual(bpy.context.mode, 'EDIT_MESH')
@@ -220,6 +295,7 @@ class PhysicsTests(unittest.TestCase):
         self.assertEqual(bpy.ops.scs.manage(action='FREE'), {'FINISHED'})
         self.assertEqual(bpy.ops.scs.manage(action='REMOVE'), {'FINISHED'})
         self.assertIn(obj.name, bpy.data.objects)
+        settings.target = None
 
     def test_pose_cloth_uses_shared_cache_and_enable_controls(self):
         bpy.ops.object.armature_add()

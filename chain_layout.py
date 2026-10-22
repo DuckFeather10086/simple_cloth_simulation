@@ -34,7 +34,10 @@ def proxy_from(context):
         return None
     if obj and obj.get(SOURCE):
         return obj[SOURCE]
+    if obj.get('scs_anchor_source'):
+        return obj['scs_anchor_source']
     regions = [o for o in context.scene.objects if o.get('scs_region_source') == obj]
+    regions += [o for o in context.scene.objects if o.get('scs_rope_proxy_source') == obj]
     if len(regions) == 1:
         return regions[0]
     return obj if obj and obj.type == 'MESH' and core.solver_for(obj) else None

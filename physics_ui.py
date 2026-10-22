@@ -1,19 +1,28 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """One sidebar for local jiggle, bone cloth and marked hanging chains."""
 import bpy
+import time
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from . import physics_core as core, mesh_physics as mesh, chain_layout as chain
 from . import skeletal_weaver as sw
 from . import region_physics as region
 from . import cloth_physics as cloth
 from . import body_collider as body
+from . import rope_proxy as rope
 
 
 class SCSPhysicsSettings(bpy.types.PropertyGroup):
     mode: EnumProperty(name='用途', items=[('JIGGLE', '软体抖动', '身体网格选区或已有软体骨骼'),
         ('CLOTH', '头发 / 衣摆', '沿用骨树织网'), ('CHAIN', '悬吊链条', '代理节点、指定 Hook、链节排列')], default='CHAIN')
     chain_input: EnumProperty(name='作用对象', items=[('REGION', '原 Mesh 的选区', '给现有网格的一部分添加模拟'),
-        ('PATH', '独立代理 / 新建链条', '直接模拟绳中心线，可沿节点排列新链节')], default='REGION')
+        ('PATH', '已有纯边绳子 / 新建中心线', '已有 Edge Mesh 本身就是模拟代理，保留其几何节点外观；无需重新生成代理')], default='REGION')
+    path_anchors: EnumProperty(name='固定点来源', items=[
+        ('PRESET', '自动端点', '单条开放绳中心线使用头部、尾部或两端'),
+        ('SELECTED', '编辑模式选中的点', '闭环或多条绳路：Tab 选择固定点，共用一个 Hook 控制点')])
+    chain_advanced: BoolProperty(name='其他链条工具', default=False)
+    proxy_nodes: IntProperty(name='代理横截面数', default=16, min=3, max=128)
+    proxy_padding: FloatProperty(name='包裹余量', default=.0005, min=.0001, unit='LENGTH')
+    proxy_settings: BoolProperty(name='代理设置', default=False)
     chain_structure: EnumProperty(name='选区结构', items=[('CONTINUOUS', '连续网格', '绳、带、垂挂部分沿路径平滑弯曲'),
         ('RINGS', '独立链环', '同一 Mesh 内每个不相连链环保持自身形状')])
     preset: EnumProperty(name='部位', items=[('BREAST', '胸部', '柔软回弹起点'),
@@ -44,12 +53,45 @@ def object_mode(context):
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
+class SCS_OT_rope_proxy(bpy.types.Operator):
+    bl_idname = 'scs.rope_proxy'
+    bl_label = '绳子线框代理'
+    bl_options = {'REGISTER', 'UNDO'}
+    action: EnumProperty(items=[('CREATE', '生成线框代理', ''), ('PHYSICS', '给代理添加物理', ''),
+                               ('REMOVE', '移除线框代理', '')])
+
+    def execute(self, context):
+        settings = context.scene.scs_physics
+        source = context.object
+        selected = None
+        if context.mode == 'EDIT_MESH':
+            source.update_from_editmode()
+            selected = [v.index for v in source.data.vertices if v.select]
+        try:
+            object_mode(context)
+            if self.action == 'CREATE':
+                started = time.perf_counter()
+                targets = rope.create(context, source, selected, count=settings.proxy_nodes,
+                                      padding=settings.proxy_padding)
+                self.report({'INFO'}, f'已生成 {len(targets)} 个线框代理（{time.perf_counter() - started:.2f} 秒）；可直接编辑，或给代理添加物理')
+            elif self.action == 'PHYSICS':
+                targets = rope.add_physics(context, rope.proxies(context), preset=settings.hook_preset)
+                self.report({'INFO'}, f'已给 {len(targets)} 个代理添加物理；从起始帧播放')
+            else:
+                rope.remove(context, rope.proxies(context))
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class SCS_OT_create(bpy.types.Operator):
     bl_idname = 'scs.create_simulation'
     bl_label = '生成模拟'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        started = time.perf_counter()
         settings = context.scene.scs_physics
         obj = context.object
         if not obj:
@@ -82,8 +124,12 @@ class SCS_OT_create(bpy.types.Operator):
                                                  hook_preset=settings.hook_preset)
                     chain.mark_nodes(proxy)
                 else:
-                    indices = mesh.preset_anchors(obj, settings.hook_preset)
-                    mesh.prepare_chain(obj, indices)
+                    manual = settings.path_anchors == 'SELECTED'
+                    if not manual:
+                        indices = mesh.preset_anchors(obj, settings.hook_preset)
+                    mesh.prepare_chain(obj, indices, automatic_hooks=not manual)
+                    if manual:
+                        mesh.add_hook(obj, indices)
                     chain.mark_nodes(obj)
             elif settings.mode == 'CLOTH':
                 if settings.cloth_pin:
@@ -109,7 +155,7 @@ class SCS_OT_create(bpy.types.Operator):
         except (ValueError, RuntimeError) as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
-        self.report({'INFO'}, '已生成；从场景起始帧连续播放预览')
+        self.report({'INFO'}, f'已生成，用时 {time.perf_counter() - started:.2f} 秒；选编号球后可新建 Hook')
         return {'FINISHED'}
 
 
@@ -131,7 +177,9 @@ class SCS_OT_chain(bpy.types.Operator):
     bl_label = '链条操作'
     bl_options = {'REGISTER', 'UNDO'}
     action: EnumProperty(items=[('MARK', '显示节点编号', ''), ('HIDE', '隐藏节点编号', ''),
-        ('HOOK', '绑定选中节点的 Hook', ''), ('LINKS', '排列 / 更新链节', ''), ('CLEAR', '移除链节外观', '')])
+        ('HOOK', '绑定选中节点的 Hook', ''), ('NEW_HOOK', '新建 Hook 控制点', ''),
+        ('EDIT', '选择代理上的固定点', ''),
+        ('LINKS', '排列 / 更新链节', ''), ('CLEAR', '移除链节外观', '')])
 
     def execute(self, context):
         settings = context.scene.scs_physics
@@ -143,13 +191,36 @@ class SCS_OT_chain(bpy.types.Operator):
         restore_edit = context.mode == 'EDIT_MESH'
         try:
             object_mode(context)
-            if self.action == 'MARK':
+            if self.action == 'EDIT':
+                for obj in context.selected_objects:
+                    obj.select_set(False)
+                proxy.hide_set(False)
+                proxy.select_set(True)
+                context.view_layer.objects.active = proxy
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='DESELECT')
+                restore_edit = False
+            elif self.action == 'MARK':
                 chain.mark_nodes(proxy)
             elif self.action == 'HIDE':
                 chain.clear_layout(proxy, 'NODE')
-            elif self.action == 'HOOK':
-                mesh.add_hook(proxy, indices, target=settings.target,
-                              bone=settings.bone if settings.target and settings.target.type == 'ARMATURE' else '')
+            elif self.action in {'HOOK', 'NEW_HOOK'}:
+                if not indices:
+                    raise ValueError('先选择编号球，或点“选择代理上的点”后选顶点')
+                if self.action == 'HOOK' and settings.target is None:
+                    raise ValueError('先指定 Hook 目标；要手动拖动，请点“新建 Hook 控制点”')
+                target = settings.target if self.action == 'HOOK' else None
+                control = mesh.add_hook(proxy, indices, target=target,
+                                        bone=settings.bone if target and target.type == 'ARMATURE' else '')
+                if target is None:
+                    restore_edit = False
+                    for obj in context.selected_objects:
+                        obj.select_set(False)
+                    control.select_set(True)
+                    context.view_layer.objects.active = control
+                    self.report({'INFO'}, f'已创建并选中 {control.name}，控制 {len(indices)} 个点；按 G 移动，清除缓存后播放')
+                else:
+                    self.report({'INFO'}, f'已将 {len(indices)} 个点绑定到 {control.name}；清除缓存后播放')
             elif self.action == 'LINKS':
                 count = chain.build_links(proxy, settings.template, axis=settings.axis,
                                           alternate=settings.alternate, fit=settings.fit, pitch=settings.pitch)
@@ -233,6 +304,26 @@ class SCS_PT_physics(bpy.types.Panel):
         settings = context.scene.scs_physics
         bone_input = bool(context.object and context.object.type == 'ARMATURE')
         layout.prop(settings, 'mode')
+        if settings.mode == 'CHAIN' and not bone_input:
+            box = layout.box()
+            box.label(text='选绳子 → 线框代理 → 按需加物理')
+            action(box, 'scs.rope_proxy', '1. 生成线框代理（Surface Deform）', 'CREATE')
+            box.prop(settings, 'proxy_settings', toggle=True)
+            if settings.proxy_settings:
+                box.prop(settings, 'proxy_nodes')
+                box.prop(settings, 'proxy_padding')
+            box.label(text='生成后可 Tab 编辑代理；原绳子跟随')
+            box.prop(settings, 'hook_preset', text='物理固定端')
+            action(box, 'scs.rope_proxy', '2. 给代理添加物理', 'PHYSICS')
+            action(box, 'scs.rope_proxy', '移除线框代理', 'REMOVE')
+            if any(core.solver_for(proxy) for proxy in rope.proxies(context)):
+                hooks = layout.box()
+                hooks.label(text='需要额外固定 / 拉动时：')
+                action(hooks, 'scs.chain_action', '选代理上的点', 'EDIT')
+                action(hooks, 'scs.chain_action', '新建 Hook（选中后按 G 拖动）', 'NEW_HOOK')
+            layout.prop(settings, 'chain_advanced', toggle=True)
+            if not settings.chain_advanced:
+                return
         if settings.mode == 'JIGGLE':
             layout.prop(settings, 'preset')
             if context.object and context.object.type == 'MESH':
@@ -253,7 +344,8 @@ class SCS_PT_physics(bpy.types.Panel):
                 layout.prop(props, 'ribbon_width')
                 layout.label(text='根部固定；发束各自成带，布片连成面')
         else:
-            layout.prop(settings, 'hook_preset')
+            if bone_input or settings.chain_input == 'REGION' or settings.path_anchors == 'PRESET':
+                layout.prop(settings, 'hook_preset')
             if bone_input:
                 layout.label(text='姿态模式选择悬吊骨链')
                 layout.label(text='生成后可选代理网格手动添加 Hook')
@@ -262,6 +354,8 @@ class SCS_PT_physics(bpy.types.Panel):
             if bone_input:
                 layout.prop(context.scene.skeletal_weaver_props, 'ribbon_width')
             elif settings.chain_input == 'REGION':
+                if context.object and context.object.type == 'MESH' and not context.object.data.polygons:
+                    layout.prop_enum(settings, 'chain_input', 'PATH', text='此对象是纯边 → 使用绳中心线')
                 layout.label(text='Tab 选择原 Mesh 中需要模拟的部分')
                 layout.prop(settings, 'chain_structure')
                 if settings.chain_structure == 'CONTINUOUS':
@@ -269,23 +363,33 @@ class SCS_PT_physics(bpy.types.Panel):
                     layout.prop(settings, 'feather')
                 layout.label(text='生成后选编号节点指定 Hook')
             else:
+                layout.label(text='已有纯边 Mesh 就是代理，直接生成模拟')
+                layout.prop(settings, 'path_anchors')
+                if settings.path_anchors == 'SELECTED':
+                    layout.label(text='Tab 仅选固定点，再点生成模拟')
+                else:
+                    layout.label(text='闭环 / 多条绳路请改为手选固定点')
                 box = layout.box()
+                box.label(text='没有绳子时，才需要新建：')
                 box.prop(settings, 'nodes')
                 box.prop(settings, 'length')
                 box.operator('scs.create_chain_proxy')
-                layout.label(text='Tab 编辑路径，再生成模拟')
         layout.operator('scs.create_simulation', icon='PHYSICS')
         if settings.mode == 'CHAIN' and not bone_input:
             box = layout.box()
-            box.label(text='节点与 Hook')
+            box.label(text='添加 Hook（固定 / 拉动绳子）')
             row = box.row(align=True)
             action(row, 'scs.chain_action', '显示编号', 'MARK')
             action(row, 'scs.chain_action', '隐藏编号', 'HIDE')
-            box.label(text='选择编号球，或 Tab 选择代理顶点')
+            box.label(text='1. 选编号球（可多选），或：')
+            action(box, 'scs.chain_action', '选择代理上的点', 'EDIT')
+            box.label(text='2. 创建可拖动控制点：')
+            action(box, 'scs.chain_action', '新建 Hook 控制点（随后按 G）', 'NEW_HOOK')
+            box.label(text='或让选中的点跟随已有物体 / 骨骼：')
             box.prop(settings, 'target')
             if settings.target and settings.target.type == 'ARMATURE':
                 box.prop_search(settings, 'bone', settings.target.data, 'bones')
-            action(box, 'scs.chain_action', '指定 Hook（空目标则新建）', 'HOOK')
+            action(box, 'scs.chain_action', '绑定到指定目标', 'HOOK')
             if settings.chain_input == 'PATH':
                 box = layout.box()
                 box.label(text='沿代理排列实际链节')
@@ -356,7 +460,7 @@ class SCS_PT_controls(bpy.types.Panel):
         action(layout, 'scs.manage', '移除当前范围的模拟', 'REMOVE')
 
 
-CLASSES = (SCSPhysicsSettings, SCS_OT_create, SCS_OT_proxy, SCS_OT_chain, SCS_OT_manage, SCS_OT_body_collider,
+CLASSES = (SCSPhysicsSettings, SCS_OT_rope_proxy, SCS_OT_create, SCS_OT_proxy, SCS_OT_chain, SCS_OT_manage, SCS_OT_body_collider,
            SCS_PT_physics, SCS_PT_controls)
 
 

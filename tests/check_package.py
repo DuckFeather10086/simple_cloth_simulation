@@ -30,5 +30,9 @@ with tempfile.TemporaryDirectory(prefix='scs-package-') as temporary:
     addon.physics_ui.cloth.prepare_cloth(obj,pins)
     assert addon.physics_ui.core.solver_for(obj).type=='CLOTH'
     addon.physics_ui.core.remove_simulations([obj])
+    path = addon.physics_ui.chain.create_proxy(bpy.context, 12, .5)
+    cages = addon.physics_ui.rope.create(bpy.context, path)
+    assert len(cages) == 1 and path.modifiers[0].is_bound
+    addon.physics_ui.rope.remove(bpy.context, cages)
     addon.unregister()
 print('STANDALONE_PACKAGE_PASS', archive.name, flush=True)

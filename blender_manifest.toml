@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "simple_cloth_simulation"
-version = "1.3.1"
+version = "1.3.2"
 name = "Simple Cloth Simulation"
 tagline = "Jiggle, cloth, hair, chain Hooks and animated body colliders"
 maintainer = "Duck Feather <https://github.com/DuckFeather10086/simple_cloth_simulation>"
